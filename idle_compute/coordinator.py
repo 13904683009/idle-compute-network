@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .crypto import content_hash, result_signing_payload
+from .crypto import content_hash
 from .db import LeaseExpired, Store, TaskUnavailable
 from .ledger import get_by_idempotency, iter_events_lenient
 from .models import Lease, Result, Task, Validation
@@ -128,7 +128,7 @@ class Coordinator:
             raise TaskUnavailable("lease not found")
         digest = content_hash(output)
         signature = self.store.signer.sign(
-            result_signing_payload(lease.task_id, lease_id, peer_id, digest)
+            self.store.signer.result_payload(lease.task_id, lease_id, peer_id, digest)
         )
         result = self.store.submit_result(lease_id, peer_id, output, digest, signature)
         return _result_dict(result)

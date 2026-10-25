@@ -128,5 +128,120 @@ class CliTests(unittest.TestCase):
         self.assertTrue(callable(module.main))
 
 
+class IdentityCommandTests(unittest.TestCase):
+    """B-4: identity command prints node_id only, is stable, never leaks keys."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.config = str(Path(self._tmp.name) / "n1" / "node.json")
+
+    def _run(self, *args: str) -> tuple[int, str, str]:
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main([*args, "--config", self.config])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_identity_prints_node_id_only_and_is_stable(self) -> None:
+        code, out, _ = self._run("identity")
+        self.assertEqual(code, 0)
+        parsed = json.loads(out)
+        self.assertEqual(set(parsed.keys()), {"node_id"})
+        node_id = parsed["node_id"]
+        self.assertTrue(node_id.startswith("12D3KooW"))
+        self.assertEqual(len(node_id), 52)
+        # Running twice prints the same node_id (seed file reuse).
+        _, out2, _ = self._run("identity")
+        self.assertEqual(json.loads(out2)["node_id"], node_id)
+
+    def test_deleting_identity_key_yields_different_node_id(self) -> None:
+        _, out1, _ = self._run("identity")
+        first = json.loads(out1)["node_id"]
+        Path(self.config).parent.joinpath("identity.key").unlink()
+        _, out2, _ = self._run("identity")
+        second = json.loads(out2)["node_id"]
+        self.assertNotEqual(first, second)
+
+    def test_identity_never_prints_key_bytes(self) -> None:
+        code, out, err = self._run("identity")
+        self.assertEqual(code, 0)
+        key_bytes = Path(self.config).parent.joinpath("identity.key").read_bytes()
+        self.assertNotIn(key_bytes, out.encode("utf-8"))
+        self.assertNotIn(key_bytes, err.encode("utf-8"))
+
+    def test_legacy_init_and_run_never_print_ledger_key_bytes(self) -> None:
+        for command in ("init", "run --peer peer-a"):
+            out, err = StringIO(), StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(command.split() + ["--db", self.db_path(), "--key", self.key_path()])
+            self.assertEqual(code, 0, (command, out.getvalue(), err.getvalue()))
+            key_bytes = Path(self.key_path()).read_bytes()
+            self.assertNotIn(key_bytes, out.getvalue().encode("utf-8"))
+            self.assertNotIn(key_bytes, err.getvalue().encode("utf-8"))
+
+    def db_path(self) -> str:
+        return str(Path(self._tmp.name) / "legacy" / "idle.db")
+
+    def key_path(self) -> str:
+        return str(Path(self._tmp.name) / "legacy" / "ledger.key")
+
+
+class PeersCommandTests(unittest.TestCase):
+    """B-4: peers add/list manage static config entries; malformed ids rejected."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.config = str(Path(self._tmp.name) / "coordinator" / "node.json")
+        # A real node id from a generated identity.
+        identity_path = Path(self._tmp.name) / "worker1" / "identity.key"
+        from idle_compute.identity import NodeIdentity
+
+        self.node_id = NodeIdentity.load_or_create(identity_path, node_name="worker1").node_id
+
+    def _run(self, *args: str) -> tuple[int, str, str]:
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main([*args, "--config", self.config])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_peers_add_is_idempotent_and_list_roundtrips(self) -> None:
+        code, out, _ = self._run("peers", "add", self.node_id, "--role", "worker")
+        self.assertEqual(code, 0)
+        peers = json.loads(out)["peers"]
+        self.assertEqual(peers[self.node_id]["role"], "worker")
+
+        # Duplicate add is idempotent: same single entry, role updated.
+        code, out, _ = self._run("peers", "add", self.node_id, "--role", "coordinator")
+        self.assertEqual(code, 0)
+        peers = json.loads(out)["peers"]
+        self.assertEqual(set(peers.keys()), {self.node_id})
+        self.assertEqual(peers[self.node_id]["role"], "coordinator")
+
+        code, out, _ = self._run("peers", "list")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["peers"], peers)
+
+    def test_peers_add_appends_addr_without_duplicates(self) -> None:
+        addr = "/ip4/127.0.0.1/tcp/12345"
+        for _ in range(2):
+            code, out, _ = self._run("peers", "add", self.node_id, "--role", "worker", "--addr", addr)
+            self.assertEqual(code, 0)
+        peers = json.loads(out)["peers"]
+        self.assertEqual(peers[self.node_id]["addrs"], [addr])
+
+    def test_malformed_node_id_is_rejected_with_structured_error(self) -> None:
+        code, out, err = self._run("peers", "add", "bogus-id", "--role", "worker")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("error", err)
+        self.assertIn("malformed node_id", err)
+
+    def test_peers_list_with_missing_config_is_empty(self) -> None:
+        code, out, _ = self._run("peers", "list")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"peers": {}})
+
+
 if __name__ == "__main__":
     unittest.main()

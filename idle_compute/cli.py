@@ -1,4 +1,11 @@
-"""Local CLI for the idle-compute MVP."""
+"""Local CLI for the idle-compute MVP.
+
+The 11 legacy commands (init/create-task/claim/run/status/events/cancel/
+expire/verify-ledger/rebuild-ledger/balances) are the Phase 1 single-process
+path (HMAC, --db/--key) and stay byte-compatible. The new network commands
+(identity, peers) take --config only — they never touch --db/--key and never
+print key material.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ from typing import Any
 
 from .coordinator import Coordinator
 from .db import DuplicateSubmission, DuplicateValidation, LeaseExpired, StoreError, TaskUnavailable
+from .identity import NodeIdentity, is_valid_node_id
 from .ledger import LedgerError
 from .state_machine import InvalidTransition
 from .tasks import InvalidTaskInput
@@ -29,6 +37,65 @@ def _parse_numbers(text: str) -> list[int]:
 
 def _coordinator(args: argparse.Namespace) -> Coordinator:
     return Coordinator(Path(args.db), Path(args.key) if args.key else None)
+
+
+def _read_config(path: Path) -> dict[str, Any]:
+    """Read a node config JSON; a missing file is an empty config."""
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed config JSON: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"config is not a JSON object: {path}")
+    return value
+
+
+def _write_config(path: Path, config: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _identity_path(config: dict[str, Any], config_path: Path) -> Path:
+    return Path(config.get("identity_key", config_path.parent / "identity.key"))
+
+
+def cmd_identity(args: argparse.Namespace) -> int:
+    """Create/load the node identity and print ONLY the node_id."""
+    config_path = Path(args.config)
+    config = _read_config(config_path)
+    identity = NodeIdentity.load_or_create(
+        _identity_path(config, config_path), node_name=config_path.parent.name
+    )
+    _print({"node_id": identity.node_id})
+    return 0
+
+
+def cmd_peers_add(args: argparse.Namespace) -> int:
+    if not is_valid_node_id(args.node_id):
+        raise ValueError(
+            f"malformed node_id: {args.node_id!r} (expected a 52-char libp2p "
+            "Ed25519 peer id starting with 12D3KooW)"
+        )
+    config_path = Path(args.config)
+    config = _read_config(config_path)
+    peers = config.setdefault("peers", {})
+    entry = peers.setdefault(args.node_id, {"role": args.role, "addrs": []})
+    entry["role"] = args.role
+    if args.addr:
+        addrs = entry.setdefault("addrs", [])
+        if args.addr not in addrs:
+            addrs.append(args.addr)
+    _write_config(config_path, config)
+    _print({"peers": config["peers"]})
+    return 0
+
+
+def cmd_peers_list(args: argparse.Namespace) -> int:
+    config = _read_config(Path(args.config))
+    _print({"peers": config.get("peers", {})})
+    return 0
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -193,6 +260,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     balances = sub.add_parser("balances", parents=[common], help="show ledger balances")
     balances.set_defaults(func=cmd_balances)
+
+    # ---- network commands (--config only, never --db/--key) ----
+
+    identity = sub.add_parser(
+        "identity", help="create/load the node identity and print its node_id only"
+    )
+    identity.add_argument(
+        "--config", default="var/node/node.json", help="node config JSON path"
+    )
+    identity.set_defaults(func=cmd_identity)
+
+    peers = sub.add_parser("peers", help="manage static peer entries in the node config")
+    peers_sub = peers.add_subparsers(dest="peers_command", required=True)
+    peers_add = peers_sub.add_parser("add", help="add or update a peer entry")
+    peers_add.add_argument("--config", default="var/node/node.json", help="node config JSON path")
+    peers_add.add_argument("node_id")
+    peers_add.add_argument("--role", required=True, choices=["coordinator", "worker", "client"])
+    peers_add.add_argument("--addr", default=None, help="multiaddr to append to the peer entry")
+    peers_add.set_defaults(func=cmd_peers_add)
+    peers_list = peers_sub.add_parser("list", help="list configured peers")
+    peers_list.add_argument("--config", default="var/node/node.json", help="node config JSON path")
+    peers_list.set_defaults(func=cmd_peers_list)
 
     return parser
 

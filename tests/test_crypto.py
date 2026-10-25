@@ -6,7 +6,74 @@ import warnings
 from pathlib import Path
 from unittest import mock
 
-from idle_compute.crypto import KEY_BYTES, LocalSigner
+from idle_compute.crypto import (
+    GENESIS_HASH,
+    KEY_BYTES,
+    LocalSigner,
+    canonical_json,
+    content_hash,
+    credit_body,
+    node_msg_payload,
+    result_payload,
+    result_signing_payload,
+    sha256_hex,
+)
+
+
+class PayloadBuilderTests(unittest.TestCase):
+    """B-2: v2 payload builders have stable golden hashes; v1 is unchanged."""
+
+    NODE_ID = "12D3KooW" + "A" * 44
+
+    def test_result_payload_golden_hash(self) -> None:
+        payload = result_payload("tsk_golden", "lea_golden", self.NODE_ID, "a" * 64)
+        self.assertIn("idle-compute-result-v2", payload)
+        self.assertNotIn("idle-compute-result-v1", payload)
+        self.assertEqual(
+            sha256_hex(payload),
+            "b11749218b96324d48fc3f0bb1c83ae87fe2ebacb6aca21fe57fd14b1c53a90e",
+        )
+
+    def test_node_msg_payload_golden_hash(self) -> None:
+        payload = node_msg_payload(
+            2, "HELLO", "12D3KooWA", "12D3KooWB", 7, "2026-10-26T00:00:00+00:00", None, {"proto": 2}
+        )
+        self.assertIn("idle-compute-node-msg-v2", payload)
+        self.assertEqual(
+            sha256_hex(payload),
+            "e52e14de818c267b2cf54ae41df82d77c4d39e759bd3e0f12304116dc61ffb73",
+        )
+
+    def test_credit_body_golden_hash(self) -> None:
+        body = credit_body(
+            "evt_golden",
+            "CREDIT",
+            "12D3KooWC",
+            "tsk_golden",
+            1,
+            "credit:tsk_golden:12D3KooWC",
+            "2026-10-26T00:00:00+00:00",
+            GENESIS_HASH,
+            {"result_id": "res_golden"},
+        )
+        self.assertIn("idle-compute-credit-v2", body["domain"])
+        self.assertEqual(
+            content_hash(body),
+            "91b00d323b049c6830605d046b4d6963eca674363fc0e00a29b2067cfeecc829",
+        )
+
+    def test_v2_domains_never_collide_with_v1(self) -> None:
+        v1 = result_signing_payload("t", "l", "p", "h")
+        v2 = result_payload("t", "l", "p", "h")
+        self.assertIn("idle-compute-result-v1", v1)
+        self.assertIn("idle-compute-result-v2", v2)
+        self.assertNotEqual(sha256_hex(v1), sha256_hex(v2))
+
+    def test_canonical_helpers_unchanged(self) -> None:
+        # Phase 1 helpers keep their exact behavior (regression pin).
+        self.assertEqual(canonical_json({"b": 1, "a": 2}), '{"a":2,"b":1}')
+        self.assertEqual(content_hash({"b": 1, "a": 2}), sha256_hex('{"a":2,"b":1}'))
+        self.assertEqual(len(GENESIS_HASH), 64)
 
 
 class KeyManagementTests(unittest.TestCase):

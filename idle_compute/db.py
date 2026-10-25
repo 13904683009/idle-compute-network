@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import ledger
-from .crypto import LocalSigner, content_hash, result_signing_payload
+from . import ledger, signing
+from .crypto import LocalSigner, content_hash
 from .models import (
     Lease,
     LeaseStatus,
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO meta(key,value) VALUES ('schema_version','1');
+INSERT OR IGNORE INTO meta(key,value) VALUES ('schema_version','2');
 
 CREATE TABLE IF NOT EXISTS peers (
     peer_id TEXT PRIMARY KEY,
@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS results (
     output_json TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     signature TEXT NOT NULL,
+    sig_algo TEXT NOT NULL DEFAULT 'hmac-sha256',
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(task_id, lease_id)
@@ -133,7 +134,28 @@ CREATE TABLE IF NOT EXISTS credit_events (
     prev_hash TEXT NOT NULL,
     event_hash TEXT NOT NULL,
     signature TEXT NOT NULL,
+    sig_algo TEXT NOT NULL DEFAULT 'hmac-sha256',
     metadata_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS node_state (
+    peer_id TEXT PRIMARY KEY,
+    last_seq_sent INTEGER NOT NULL DEFAULT 0,
+    last_seq_seen INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS claims (
+    claim_request_id TEXT PRIMARY KEY,
+    lease_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS client_refs (
+    client_ref TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -150,11 +172,46 @@ def _is_expired(expires_at: str, now: str) -> bool:
     return datetime.fromisoformat(expires_at) <= datetime.fromisoformat(now)
 
 
+def _column_names(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Additive schema v2 migration for v1 databases (in place).
+
+    v1 tables lack the sig_algo columns; existing rows default to
+    'hmac-sha256' and are NEVER re-signed. The new node_state/claims/
+    client_refs tables come from SCHEMA (CREATE IF NOT EXISTS).
+    """
+    if "sig_algo" not in _column_names(conn, "results"):
+        conn.execute(
+            "ALTER TABLE results ADD COLUMN sig_algo TEXT NOT NULL DEFAULT 'hmac-sha256'"
+        )
+    if "sig_algo" not in _column_names(conn, "credit_events"):
+        conn.execute(
+            "ALTER TABLE credit_events ADD COLUMN sig_algo TEXT NOT NULL DEFAULT 'hmac-sha256'"
+        )
+    conn.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+
+
 class Store:
-    def __init__(self, db_path: str | Path, key_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        key_path: str | Path | None = None,
+        *,
+        signer: signing.SigningPolicy | None = None,
+    ) -> None:
+        """Open (creating if needed) the store.
+
+        Legacy mode (default, signer=None): HMAC policy over the local
+        ledger.key file — the Phase 1 single-process path, unchanged.
+
+        Network mode (signer=policy): the policy is injected by the caller
+        (Ed25519Policy); no HMAC key file is created or read.
+        """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.key_path = Path(key_path) if key_path else self.db_path.parent / "ledger.key"
         self.conn = sqlite3.connect(str(self.db_path), timeout=10)
         self.conn.row_factory = sqlite3.Row
         try:
@@ -162,8 +219,16 @@ class Store:
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.execute("PRAGMA busy_timeout=5000")
             self.conn.executescript(SCHEMA)
+            _migrate_schema(self.conn)
             self.conn.commit()
-            self.signer = LocalSigner.load_or_create(self.key_path)
+            if signer is not None:
+                self.signer = signer
+                self.key_path = None
+            else:
+                self.key_path = Path(key_path) if key_path else self.db_path.parent / "ledger.key"
+                self.signer = signing.HmacLegacyPolicy(
+                    LocalSigner.load_or_create(self.key_path)
+                )
         except Exception:
             # Failed init must not leak the open handle; on Windows a leaked
             # handle keeps a corrupt DB file locked until GC.
@@ -172,6 +237,10 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    @property
+    def _scheme(self) -> str:
+        return getattr(self.signer, "scheme", "hmac-sha256")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -470,8 +539,8 @@ class Store:
             try:
                 self.conn.execute(
                     "INSERT INTO results "
-                    "(result_id,task_id,lease_id,peer_id,output_json,content_hash,signature,status,created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    "(result_id,task_id,lease_id,peer_id,output_json,content_hash,signature,sig_algo,status,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (
                         result_id,
                         task.task_id,
@@ -480,6 +549,7 @@ class Store:
                         json.dumps(output, ensure_ascii=False, sort_keys=True),
                         content_hash_value,
                         signature,
+                        self._scheme,
                         ResultStatus.SUBMITTED.value,
                         now,
                     ),
@@ -547,14 +617,23 @@ class Store:
             task_type = get_task_type(task.task_type)
             expected = task_type.execute(task.payload)
             expected_hash = content_hash(expected)
-            signature_payload = result_signing_payload(result.task_id, result.lease_id, result.peer_id, result.content_hash)
+            signature_payload = self.signer.result_payload(
+                result.task_id, result.lease_id, result.peer_id, result.content_hash
+            )
             # Direct DB tampering can yield NULL signature/content_hash rows even
-            # though the columns are NOT NULL; guard before hmac (mirrors the
-            # ledger verify guard) and treat as an invalid signature.
+            # though the columns are NOT NULL; guard before verifying (mirrors the
+            # ledger verify guard) and treat as an invalid signature. The row's
+            # sig_algo tag must match the store's scheme (a flipped tag is a
+            # tamper signal, not a downgrade path).
+            sig_row = self.conn.execute(
+                "SELECT sig_algo FROM results WHERE result_id=?", (result_id,)
+            ).fetchone()
             signature_ok = (
                 isinstance(result.signature, str)
                 and isinstance(result.content_hash, str)
-                and self.signer.verify(signature_payload, result.signature)
+                and sig_row is not None
+                and sig_row["sig_algo"] == self._scheme
+                and self.signer.verify_result(result.peer_id, signature_payload, result.signature)
             )
             output_ok = task_type.verify(task.payload, result.output)
             hash_ok = result.content_hash == content_hash(result.output) == expected_hash
