@@ -166,6 +166,12 @@ class Libp2pTransport(NetTransport):
         self._write_lock = threading.Lock()          # serializes outbound writes
         self._dialed_addrs: dict[str, list[str]] = {}  # peer_id -> last dialed addrs
         self._dialed_lock = threading.Lock()
+        # One handler thread per stream (inbound or dialed): cap concurrent
+        # streams so hostile dials cannot spawn unbounded threads (audit
+        # finding transport_tcp.py:322 applies here too).
+        self._max_streams = 64
+        self._active_streams = 0
+        self._active_streams_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._host: Any = None
         self._trio_token: Any = None  # captured inside the trio loop
@@ -385,6 +391,8 @@ class Libp2pTransport(NetTransport):
         # the node layer without a second dial in reverse.
         handler = self._handler
         if handler is not None:
+            with self._active_streams_lock:
+                self._active_streams += 1
             threading.Thread(
                 target=self._serve_stream,
                 args=(handler, peer_id, stream),
@@ -432,6 +440,18 @@ class Libp2pTransport(NetTransport):
             except Exception:
                 pass
             return
+        with self._active_streams_lock:
+            if self._active_streams >= self._max_streams:
+                over_limit = True
+            else:
+                over_limit = False
+                self._active_streams += 1
+        if over_limit:
+            try:
+                await stream.reset()
+            except Exception:
+                pass
+            return
         threading.Thread(
             target=self._serve_stream,
             args=(handler, peer_id, stream),
@@ -455,6 +475,8 @@ class Libp2pTransport(NetTransport):
                 self._from_thread(stream.close)
             except BaseException:
                 pass
+            with self._active_streams_lock:
+                self._active_streams -= 1
 
     def _require_started(self) -> None:
         if not self._running:

@@ -331,17 +331,37 @@ class SeqWindow:
     Persistence hooks (``load``/``save``) are optional; the coordinator
     wires them to the node_state table (F-1), plain nodes default to
     in-memory windows.
+
+    The in-memory map is bounded by ``max_entries``: hostile connectors can
+    present an unlimited number of fresh self-signed identities, and every
+    accepted frame records one entry. On overflow, entries that fail the
+    ``keep`` predicate are dropped first; if the bound is still exceeded
+    the map is cleared (replay protection degrades for one window's worth
+    of peers rather than the process growing without bound).
     """
 
     def __init__(
         self,
         load: Callable[[str], int] | None = None,
         save: Callable[[str, int], None] | None = None,
+        max_entries: int = 1024,
+        keep: Callable[[str], bool] | None = None,
     ) -> None:
         self._memory: dict[str, int] = {}
         self._lock = threading.RLock()  # check_and_update nests a _last_seen call
         self._load = load
         self._save = save
+        self._max_entries = max_entries
+        self._keep = keep
+
+    def _evict_if_needed(self) -> None:
+        if len(self._memory) <= self._max_entries:
+            return
+        if self._keep is not None:
+            for peer_id in [key for key in self._memory if not self._keep(key)]:
+                del self._memory[peer_id]
+        if len(self._memory) > self._max_entries:
+            self._memory.clear()
 
     def _last_seen(self, peer_id: str) -> int:
         with self._lock:
@@ -349,6 +369,7 @@ class SeqWindow:
                 return self._memory[peer_id]
             value = self._load(peer_id) if self._load else 0
             self._memory[peer_id] = value
+            self._evict_if_needed()
             return value
 
     def check_and_update(self, peer_id: str, seq: int) -> None:
@@ -369,6 +390,7 @@ class SeqWindow:
                     f"seq {seq} beyond window {last + SEQ_WINDOW} for {peer_id[:12]}...",
                 )
             self._memory[peer_id] = seq
+            self._evict_if_needed()
             if self._save:
                 self._save(peer_id, seq)
 

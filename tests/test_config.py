@@ -33,7 +33,13 @@ COORD = NODE_A
 
 
 def worker_cfg(**overrides):
-    cfg = {"role": "worker", "data_dir": "var/idle-node", "coordinator_node_id": COORD}
+    cfg = {
+        "role": "worker",
+        "data_dir": "var/idle-node",
+        "coordinator_node_id": COORD,
+        # Symmetric default-deny: the coordinator must be allowlisted.
+        "peers": [COORD],
+    }
     cfg.update(overrides)
     return cfg
 
@@ -211,7 +217,28 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("peers", str(ctx.exception))
 
     def test_peers_default_deny_is_the_default(self) -> None:
-        self.assertEqual(from_dict(worker_cfg()).peers, [])
+        # For the coordinator (no mandatory peer) an omitted peers list
+        # still means "nobody may connect": default-deny.
+        self.assertEqual(from_dict({"role": "coordinator", "data_dir": "var/x"}).peers, [])
+        # Worker/client REQUIRE the coordinator in peers (symmetric
+        # default-deny); a worker that omits it fails loudly at load time.
+        self.assertEqual(from_dict(worker_cfg()).peers, [COORD])
+        with self.assertRaises(ValidationError) as ctx:
+            from_dict(worker_cfg(peers=[]))
+        self.assertIn("peers", str(ctx.exception))
+        with self.assertRaises(ValidationError) as ctx:
+            from_dict(worker_cfg(peers=[NODE_B]))
+        self.assertIn("peers", str(ctx.exception))
+        with self.assertRaises(ValidationError) as ctx:
+            from_dict(
+                {
+                    "role": "client",
+                    "data_dir": "var/x",
+                    "coordinator_node_id": COORD,
+                    "peers": [NODE_B],
+                }
+            )
+        self.assertIn("peers", str(ctx.exception))
 
     def test_poll_interval_out_of_range_rejected(self) -> None:
         for value in (0, 61):
@@ -262,14 +289,16 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("log_file", str(ctx.exception))
 
     def test_defaults_applied(self) -> None:
-        cfg = from_dict({"role": "worker", "data_dir": "var/n", "coordinator_node_id": COORD})
+        cfg = from_dict(
+            {"role": "worker", "data_dir": "var/n", "coordinator_node_id": COORD, "peers": [COORD]}
+        )
         self.assertIsNone(cfg.node_id)
         self.assertEqual(cfg.transport, "libp2p")
         self.assertEqual(cfg.listen_host, "127.0.0.1")
         self.assertEqual(cfg.listen_port, 0)
         self.assertFalse(cfg.allow_public_listen)
         self.assertIsNone(cfg.db_path)
-        self.assertEqual(cfg.peers, [])
+        self.assertEqual(cfg.peers, [COORD])
         self.assertIsNone(cfg.coordinator_addr)
         self.assertEqual(cfg.poll_interval_seconds, 5)
         self.assertEqual(cfg.backoff_min, 1.0)
@@ -306,7 +335,7 @@ class ConfigValidationTests(unittest.TestCase):
                 "allow_public_listen": False,
                 "data_dir": "var/worker",
                 "db_path": None,
-                "peers": [],
+                "peers": [NODE_A],
                 "coordinator_node_id": NODE_A,
                 "coordinator_addr": "127.0.0.1:43123",
                 "poll_interval_seconds": 5,
@@ -347,6 +376,7 @@ class LoadConfigTests(unittest.TestCase):
             "role": "worker",
             "data_dir": "var/n",
             "coordinator_node_id": COORD,
+            "peers": [COORD],
             "transport": "tcp",
             "poll_interval_seconds": 9,
         }

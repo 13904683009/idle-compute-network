@@ -23,22 +23,30 @@
 | B-3 | db.py schema v2 附加迁移 + node_state/claims 表 + 可注入签名/验签策略；ledger.py 逐行按方案验签 + 批量导出 | 主循环 | done | 57 项既有测试原样全过（HMAC 默认）；v1 DB 原地迁移 schema_version='2' 且 sig_algo 默认 'hmac-sha256'；网络模式 Ed25519 记账+验账通过；篡改 sig/prev_hash/amount 验账失败；hmac 行在 Ed25519Policy 下结构化 CONFLICT；validate_result 接受工人 Ed25519 签名并拒绝异钥；node_state/claims/client_refs 三表存在；one_active_lease/UNIQUE 约束存在；ledger.py export_since+verify_and_append | 本阶段测试日志 |
 | B-4 | CLI：identity + peers 命令；密钥永不打印测试 | 主循环 | done | identity 两次同 node_id、删钥后不同；stdout/stderr 无 identity.key/ledger.key 字节；peers add/list 幂等；畸形 node_id 结构化报错；11 条旧命令测试全过 | 本阶段测试日志 |
 
-## 阶段 C（传输层）
+## 阶段 C（传输层 + 节点运行时）
+
+> 执行说明：WAVE 0（提交 269e1cf）交付 C-1/C-2/C-4；WAVE 1（提交 14cc40a）把
+> C-3 与 D-1/D-2/D-3 的应用协议核心合并进 `idle_compute/node.py` 单一运行时
+> （协调者 actor / 工人拉取循环 / client 一次性操作），以 15 项真实多进程 E2E
+> 测试（tests/test_node.py）验收。RENEW 续租与 LEDGER_SYNC 按原计划留在阶段 E/F。
 
 | ID | 任务 | 负责人 | 状态 | 验收标准 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| C-1 | net_transport.py Libp2pTransport 适配器 + 双真实进程冒烟 + 导入遏制测试 | 待定 | todo | 依赖钉版核对；两个独立进程经 PeerInfo+临时端口+addr 文件交接回环互发 PING/PONG；stream.muxed_conn.peer_id 解析远程对等方；帧编解码单测无 libp2p；libp2p 仅出现在 identity.py+net_transport.py；无 asyncio | — |
-| C-2 | protocol.py：信封、帧编解码、封闭类型注册表、先验签后解析管线 | 主循环 | done | 信封金标准哈希；域 'idle-compute-node-msg-v2'；seq 窗口 (last_seen, last_seen+4096]；ts ±300/600s；先验签后解析顺序可观测；65537 字节帧不分配缓冲即拒；16 个 ERROR 码；JSON 深度 17 拒 | tests/test_protocol.py 45/45 绿；金标准 log 见 logs/idle-compute/phase2-C-golden.log |
-| C-3 | config.py + node.py 运行时 + HELLO/HELLO_ACK/PING/PONG + 白名单 + rendezvous 文件 | 待定 | todo | 配置校验（未知键/重复 db_path/畸形 node_id）；trio 版本启动断言；三真实进程 HELLO 互见；无 mDNS/UPnP/DHT；未列名单 HELLO→UNAUTHORIZED；PING→PONG；SIGINT 2 秒内退出码 0；坏签名 HELLO 丢弃 | — |
-| C-4 | transport_tcp.py 纯标准库 TCP 回退模块（单模块应急预案） | 待定 | todo | 与 LocalLoopbackTransport 同契约测试（真实子进程回环）；零非标准库导入；compileall 通过；ARCHITECTURE.md 记录为一行开关可切换 | — |
+| C-1 | net_transport.py Libp2pTransport 适配器 + 双真实进程冒烟 + 导入遏制测试 | 主循环 | done | 依赖钉版核对；两个独立进程经 PeerInfo+临时端口+addr 文件交接回环互发 PING/PONG；stream.muxed_conn.peer_id 解析远程对等方；帧编解码单测无 libp2p；libp2p 仅出现在 identity.py+net_transport.py；无 asyncio | tests/test_transport_libp2p.py + test_net_transport.py（16/16 绿，含真实子进程冒烟）；提交 269e1cf |
+| C-2 | protocol.py：信封、帧编解码、封闭类型注册表、先验签后解析管线 | 主循环 | done | 信封金标准哈希；域 'idle-compute-node-msg-v2'；seq 窗口 (last_seen, last_seen+4096]；ts ±300/600s；先验签后解析顺序可观测；65537 字节帧不分配缓冲即拒；16 个 ERROR 码；JSON 深度 17 拒 | tests/test_protocol.py 46/46 绿；金标准 log 见 logs/idle-compute/phase2-C-golden.log |
+| C-3 | config.py + node.py 运行时 + HELLO/HELLO_ACK/PING/PONG + 白名单 + rendezvous 文件 | 主循环 | done | 配置校验（未知键/重复 db_path/畸形 node_id）；trio 版本启动断言；三真实进程 HELLO 互见；无 mDNS/UPnP/DHT；未列名单 HELLO→UNAUTHORIZED；PING→PONG；SIGINT 路径退出码 0；坏签名 HELLO 丢弃 | tests/test_config.py 41/41 绿；tests/test_node.py 15/15 绿（多进程）；未列名单/坏签名/畸形帧/超大帧关闭流均验证；提交 14cc40a |
+| C-4 | transport_tcp.py 纯标准库 TCP 回退模块（单模块应急预案） | 主循环 | done | 与 NetTransport 同契约测试（真实子进程回环）；零非标准库导入；compileall 通过；一行配置可切换（config.transport） | tests/test_transport_tcp.py 全绿（真实回环）；提交 269e1cf |
 
 ## 阶段 D（应用协议）
 
+> 已随 WAVE 1 交付（见上注）；RENEW/续租、LEDGER_SYNC、并发任务上限等按原计划
+> 属于阶段 E/F，未提前实现。
+
 | ID | 任务 | 负责人 | 状态 | 验收标准 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| D-1 | coordinator_server.py 线上处理器（HELLO/CLAIM/START/RENEW/SUBMIT/STATUS/LEDGER_SYNC/PING/TASK_CREATE） | 待定 | todo | 模拟层测试：TASK_CREATE 先过白名单；CLAIM 幂等（重传同 lease）；持有租约再 CLAIM→TASK_UNAVAILABLE；并发 CLAIM 恰 1 条活跃租约；START 幂等；RENEW 限帽；正确结果→RESULT_ACK VALID+内联签名记账；错输出/坏签名→REJECTED；重复提交同 hash→存回同结果；异 hash→ERROR(DUPLICATE)；过期租约→LEASE_EXPIRED+重排队语义；全部状态转移在 ALLOWED 表内 | — |
-| D-2 | worker_node.py 循环 + worker_store.py 镜像（claim/start/execute/sign/submit/renew/backoff/resume） | 待定 | todo | 轮询 CLAIM(min(5s, lease/4))；以本节点密钥签 result-v2；仅接受钉定协调者 node_id 签名的 RESULT_ACK；credit 事件验签+验哈希链后才入 ledger_copy；50% 续租；协调者死亡→1..8s 退避重拨；重启续跑或过期放弃；畸形 grant 不执行；并发任务上限 1；worker_store 单测（seq 连续性/hash 链/去重/verified 标记/游标） | — |
-| D-3 | cli.py client/node 命令 + 3 真实进程端到端幸福路径 | 待定 | todo | 真实 3 进程（协调者+2 工人+client 驱动）：create-task 返回 task_id；一工人执行提交；DB COMPLETED/RELEASED/恰 1 记账事件；余额恰 1 次；并发 claim 无第二活跃租约；client_ref 幂等；status 显示 COMPLETED；第二任务被空闲工人接走；杀工人→清扫重排队→幸存者完成；脚本连跑两遍干净；57 旧测试仍全过 | — |
+| D-1 | 线上处理器（HELLO/CLAIM/SUBMIT/STATUS/PING/TASK_CREATE，node.py 协调者侧） | 主循环 | done | TASK_CREATE 先过白名单；CLAIM 幂等（重传同 lease，claims 表 upsert）；正确结果→RESULT_ACK VALID+内联签名记账；错输出→INVALID 无记账；重复提交→ERROR(DUPLICATE) 单记账；过期租约→重排队语义；全部状态转移经 Store 状态机（LEASED→RUNNING→SUBMITTED→VALIDATED） | tests/test_node.py：duplicate claim/submit、forged result、abandoned-lease requeue 等 9 项对抗测试绿 |
+| D-2 | 工人循环 + ledger_copy 镜像（claim/execute/sign/submit/backoff/resume，node.py 工人侧） | 主循环 | done | 以本节点密钥签 result-v2；credit 事件经 verify_and_append（验签+哈希链）后才入 ledger_copy；协调者死亡→1..8s 退避重拨；重启续跑（seq.json 持久化）；畸形 grant 不执行（schema 先校验） | tests/test_node.py：restart recovery、coordinator restart reconnect、mirror verified=1 断言绿 |
+| D-3 | cli.py node 命令 + 3 真实进程端到端幸福路径 | 主循环 | done | 真实多进程（协调者+工人子进程+client 驱动）：create-task 返回 task_id；工人执行提交；DB COMPLETED/恰 1 记账事件；status 显示 VALID+credits_count；第二任务被重启工人接走；杀工人→过期重排队→他人接走；244 测试全量回归绿 | tests/test_node.py 15/15（TCP 与 libp2p 双传输）；提交 14cc40a |
 
 ## 阶段 E（账本同步）
 

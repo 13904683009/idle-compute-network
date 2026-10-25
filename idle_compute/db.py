@@ -322,6 +322,25 @@ class Store:
             created_at=row["created_at"],
         )
 
+    def get_result_by_lease(self, lease_id: str) -> Result | None:
+        """The result submitted under ``lease_id`` (idempotent resubmission)."""
+        row = self.conn.execute(
+            "SELECT * FROM results WHERE lease_id=?", (lease_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return Result(
+            result_id=row["result_id"],
+            task_id=row["task_id"],
+            lease_id=row["lease_id"],
+            peer_id=row["peer_id"],
+            output=json.loads(row["output_json"]),
+            content_hash=row["content_hash"],
+            signature=row["signature"],
+            status=ResultStatus(row["status"]),
+            created_at=row["created_at"],
+        )
+
     def get_validation(self, result_id: str) -> Validation | None:
         row = self.conn.execute("SELECT * FROM validations WHERE result_id=?", (result_id,)).fetchone()
         if not row:

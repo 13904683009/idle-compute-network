@@ -1,11 +1,15 @@
-"""Multi-process E2E tests for the Phase C node runtime (node.py + CLI).
+"""E2E tests for the Phase C node runtime (node.py + CLI).
 
-These are REAL multi-process tests: the coordinator and worker run as
-separate Python interpreter processes (``python -m idle_compute node run``)
-over the TCP transport, and every assertion crosses a real socket between
-processes. Manual hostile peers are bare TcpTransport instances driven
-frame-by-frame against the real coordinator. Nothing here is a
-single-process simulation of the network path.
+The core credit-cycle tests are REAL multi-process: the coordinator and
+worker run as separate Python interpreter processes
+(``python -m idle_compute node run``) over the TCP transport, and every
+assertion crosses a real socket between processes. Manual hostile peers
+are bare TcpTransport instances driven frame-by-frame against the real
+coordinator (real sockets, no Node object on the hostile side). The
+libp2p-credit, ping, and coordinator-restart tests run the coordinator
+IN-PROCESS (a Node on a thread) — still real transports and real
+sockets, but not separate interpreter processes; each such test says so
+in its docstring.
 
 Covered invariants (per the Phase C directive):
 - happy path: task created by a client process, claimed/executed/submitted
@@ -16,7 +20,11 @@ Covered invariants (per the Phase C directive):
 - unauthorized HELLO (not on the allowlist): UNAUTHORIZED, dropped;
 - illegal body, garbage frame, oversized frame;
 - duplicate CLAIM_REQUEST -> same lease (no second lease);
-- duplicate SUBMIT_RESULT -> DUPLICATE error, no double credit;
+- duplicate SUBMIT_RESULT -> the original RESULT_ACK for the same peer
+  (idempotent, no double credit) and a non-disclosing refusal for a
+  foreign peer;
+- an ERROR sent to the coordinator is never answered (no echo storm);
+- hostile wire 'type' strings still get schema-valid errors (ref_type clamped);
 - abandoned lease -> task requeued after expiry;
 - worker restart keeps working (persisted seq on both sides);
 - coordinator restart -> worker reconnects and completes work;
@@ -378,6 +386,9 @@ class HappyPathTests(InProcessCoordinatorMixin, NodeTestsBase):
         self.assertEqual(rows[0][1], 1, "mirrored events must be verified")
         self.assertEqual(event["amount"], 1)
         self.assertEqual(event["task_id"], task_id)
+        # The credit is paid to the worker that did the work — not to the
+        # coordinator, the client, or anyone else.
+        self.assertEqual(event["peer_id"], worker_identity.node_id)
 
     def test_full_credit_cycle_libp2p_inprocess(self) -> None:
         """The whole stack also runs over the libp2p transport (in-process)."""
@@ -525,6 +536,33 @@ class AdversarialWireTests(InProcessCoordinatorMixin, NodeTestsBase):
         self.assertIsNotNone(error, "non-allowlisted HELLO must be answered UNAUTHORIZED")
         self.assertTrue(rogue.wait_closed(5.0), "coordinator must drop the unauthorized stream")
 
+        # Seq persistence is allowlist-gated: the rejected stranger's frame
+        # passed parse (valid signature + window) but must NOT have grown
+        # node_state — hostile connectors must not grow the DB (audit
+        # finding node.py:347).
+        db = self._coord_db(node)
+        row = db.execute(
+            "SELECT COUNT(*) FROM node_state WHERE peer_id=?", (rogue.identity.node_id,)
+        ).fetchone()
+        self.assertEqual(row[0], 0, "non-allowlisted senders must not persist seq state")
+
+    def test_hello_identity_mismatch_rejected(self) -> None:
+        """HELLO whose body claims a DIFFERENT node_id than the sender: BAD_SENDER."""
+        coord_tmp = self.tmp("coord")
+        peer = ManualPeer(_identity(self.tmp("peer"), "peer"))
+        self.addCleanup(peer.stop)
+        node, addr = self.start_coordinator(coord_tmp, [peer.identity.node_id])
+        peer.connect(node.identity.node_id, addr)
+
+        # Signature is valid for the SENDER; the body lies about the node_id.
+        peer.send_craft(
+            MessageType.HELLO,
+            {"node_id": node.identity.node_id, "role": "worker", "listen_addrs": ["127.0.0.1:1"]},
+        )
+        error = peer.expect_error(ErrorCode.BAD_SENDER, 5.0)
+        self.assertIsNotNone(error, "identity mismatch must be answered BAD_SENDER")
+        self.assertTrue(peer.wait_closed(5.0), "mismatched HELLO must close the stream")
+
     def test_illegal_body_gets_error_and_stream_survives(self) -> None:
         """A signed frame with an illegal body: INVALID_BODY; stream stays usable."""
         coord_tmp = self.tmp("coord")
@@ -558,8 +596,14 @@ class AdversarialWireTests(InProcessCoordinatorMixin, NodeTestsBase):
         self.assertIsNotNone(peer.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 5.0))
 
         peer.send(encode_frame(b"this is not json at all"))
+        # Undecodable bytes must be dropped SILENTLY: the coordinator may
+        # not answer with a (well-formed) ERROR envelope either. Scan the
+        # frame buffer, not _errors — a structured ERROR reply parses fine
+        # and would land in _frames, never in _errors.
         time.sleep(0.5)
-        self.assertFalse(peer._errors, "garbage must not produce a protocol error reply")
+        with peer._lock:
+            error_replies = [e for e in peer._frames if e.type is MessageType.ERROR]
+        self.assertEqual(error_replies, [], "garbage must not produce an ERROR reply")
 
         peer.send_craft(MessageType.PING, {"nonce": "after-garbage"})
         pong = peer.wait_for(
@@ -589,7 +633,11 @@ class AdversarialWireTests(InProcessCoordinatorMixin, NodeTestsBase):
         self.assertIsNotNone(other.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 5.0))
         other.send_craft(MessageType.PING, {"nonce": "healthy"})
         self.assertIsNotNone(
-            other.wait_for(lambda e: e.type is MessageType.PONG, 5.0)
+            other.wait_for(
+                lambda e: e.type is MessageType.PONG and e.body["nonce"] == "healthy",
+                5.0,
+            ),
+            "PONG must echo our nonce (content, not just a PONG-shaped frame)",
         )
 
     def test_forged_result_rejected_no_credit(self) -> None:
@@ -685,12 +733,63 @@ class AdversarialWireTests(InProcessCoordinatorMixin, NodeTestsBase):
         count = db.execute("SELECT COUNT(*) FROM leases WHERE task_id=?", (task_id,)).fetchone()[0]
         self.assertEqual(count, 1, "a replayed claim must not create a second lease")
 
-    def test_duplicate_submission_no_double_credit(self) -> None:
-        """Resubmitting the same result: DUPLICATE error, exactly one credit."""
+    def test_second_peer_claim_replay_denied_no_new_lease(self) -> None:
+        """A DIFFERENT peer replaying a known claim id: DENIED, no lease minted."""
         coord_tmp = self.tmp("coord")
         peer = ManualPeer(_identity(self.tmp("peer"), "peer"))
+        thief = ManualPeer(_identity(self.tmp("thief"), "thief"))
         self.addCleanup(peer.stop)
-        node, addr = self.start_coordinator(coord_tmp, [peer.identity.node_id])
+        self.addCleanup(thief.stop)
+        node, addr = self.start_coordinator(coord_tmp, [peer.identity.node_id, thief.identity.node_id])
+        peer.connect(node.identity.node_id, addr)
+        peer.hello()
+        self.assertIsNotNone(peer.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 5.0))
+        thief.connect(node.identity.node_id, addr)
+        thief.hello()
+        self.assertIsNotNone(thief.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 5.0))
+
+        peer.send_craft(
+            MessageType.TASK_CREATE,
+            {
+                "client_ref": "clr-thief-1",
+                "task_type": "numeric_batch_v1",
+                "payload": {"numbers": [5]},
+                "max_attempts": 3,
+                "lease_seconds": 30,
+            },
+        )
+        task_id = peer.wait_for(lambda e: e.type is MessageType.TASK_CREATE_ACK, 5.0).body["task_id"]
+
+        peer.send_craft(MessageType.CLAIM_REQUEST, {"claim_request_id": "crq-thief-1", "task_id": None})
+        grant = peer.wait_for(lambda e: e.type is MessageType.CLAIM_GRANT, 5.0)
+        self.assertIsNotNone(grant, "the honest claim must be granted")
+
+        # The thief replays the SAME claim_request_id: known id + foreign
+        # owner must be denied WITHOUT minting a second lease on the task.
+        thief.send_craft(MessageType.CLAIM_REQUEST, {"claim_request_id": "crq-thief-1", "task_id": None})
+        denied = thief.wait_for(
+            lambda e: e.type is MessageType.CLAIM_DENIED and e.body["claim_request_id"] == "crq-thief-1",
+            5.0,
+        )
+        self.assertIsNotNone(denied, "a foreign claim replay must be denied")
+
+        db = self._coord_db(node)
+        count = db.execute("SELECT COUNT(*) FROM leases WHERE task_id=?", (task_id,)).fetchone()[0]
+        self.assertEqual(count, 1, "a foreign replay must not mint a second lease")
+        self.assertEqual(
+            db.execute("SELECT COUNT(*) FROM claims WHERE claim_request_id=?", ("crq-thief-1",)).fetchone()[0],
+            1,
+            "the claims row must still map to the original lease",
+        )
+
+    def test_duplicate_submission_no_double_credit(self) -> None:
+        """Resubmitting the same result replays the SAME ack, exactly one credit."""
+        coord_tmp = self.tmp("coord")
+        peer = ManualPeer(_identity(self.tmp("peer"), "peer"))
+        other = ManualPeer(_identity(self.tmp("other"), "other"))
+        self.addCleanup(peer.stop)
+        self.addCleanup(other.stop)
+        node, addr = self.start_coordinator(coord_tmp, [peer.identity.node_id, other.identity.node_id])
         peer.connect(node.identity.node_id, addr)
         peer.hello()
         self.assertIsNotNone(peer.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 5.0))
@@ -735,9 +834,26 @@ class AdversarialWireTests(InProcessCoordinatorMixin, NodeTestsBase):
         self.assertEqual(first_ack.body["validation"], "VALID")
         self.assertIsNotNone(first_ack.body["credit"])
 
+        # Idempotent replay (same peer): the SAME RESULT_ACK comes back —
+        # a worker whose original ack was lost still receives its credit
+        # event instead of a bare DUPLICATE error.
         peer.send_craft(MessageType.SUBMIT_RESULT, submit)
-        duplicate = peer.expect_error(ErrorCode.DUPLICATE, 5.0)
-        self.assertIsNotNone(duplicate, "a second submission must be answered DUPLICATE")
+        replay_ack = peer.wait_for(lambda e: e.type is MessageType.RESULT_ACK, 5.0)
+        self.assertIsNotNone(replay_ack, "a replayed submission must replay the same RESULT_ACK")
+        self.assertEqual(replay_ack.body["result_id"], first_ack.body["result_id"])
+        self.assertEqual(replay_ack.body["validation"], "VALID")
+        self.assertIsNotNone(replay_ack.body["credit"])
+
+        # A DIFFERENT peer replaying the same lease is refused at the
+        # ownership gate (TASK_UNAVAILABLE -- the lease is not theirs, and
+        # the reply must not disclose that a result exists): credit is
+        # never delivered to a stranger.
+        other.connect(node.identity.node_id, addr)
+        other.hello()
+        self.assertIsNotNone(other.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 5.0))
+        other.send_craft(MessageType.SUBMIT_RESULT, submit)
+        refused = other.expect_error(ErrorCode.TASK_UNAVAILABLE, 5.0)
+        self.assertIsNotNone(refused, "a foreign replay must be refused without disclosure")
 
         peer.send_craft(MessageType.STATUS_REQUEST, {"task_id": task_id})
         status = peer.wait_for(lambda e: e.type is MessageType.STATUS_RESPONSE, 5.0)
@@ -791,6 +907,81 @@ class AdversarialWireTests(InProcessCoordinatorMixin, NodeTestsBase):
         self.assertEqual(second_grant.body["lease"]["task_id"], task_id)
         self.assertNotEqual(second_grant.body["lease"]["lease_id"], first_lease_id)
 
+    def test_error_envelope_never_answered(self) -> None:
+        """An ERROR sent to the coordinator must not itself be answered:
+        replying to an ERROR would let a hostile peer start an echo storm."""
+        coord_tmp = self.tmp("coord")
+        peer = ManualPeer(_identity(self.tmp("peer"), "peer"))
+        self.addCleanup(peer.stop)
+        node, addr = self.start_coordinator(coord_tmp, [peer.identity.node_id])
+        peer.connect(node.identity.node_id, addr)
+        peer.hello()
+        self.assertIsNotNone(peer.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 5.0))
+
+        # Schema-valid ERROR body (all four registered keys), so the
+        # envelope parses and reaches the dispatch path -- which must not
+        # answer it. (A malformed body would instead take the parse-error
+        # path, whose ERROR reply is legitimate.)
+        peer.send_craft(
+            MessageType.ERROR,
+            {
+                "code": ErrorCode.INTERNAL.value,
+                "message": "probe",
+                "ref_type": None,
+                "ref_seq": None,
+            },
+        )
+        time.sleep(1.0)
+        with peer._lock:
+            self.assertNotIn(
+                MessageType.ERROR,
+                [env.type for env in peer._frames],
+                "coordinator must not answer an ERROR",
+            )
+        # The stream must survive: the same connection still serves PING.
+        peer.send_craft(MessageType.PING, {"nonce": "still-alive"})
+        pong = peer.wait_for(
+            lambda e: e.type is MessageType.PONG and e.body["nonce"] == "still-alive",
+            5.0,
+        )
+        self.assertIsNotNone(pong, "the stream must stay usable after the ERROR")
+
+    def test_hostile_wire_type_string_gets_schema_valid_error(self) -> None:
+        """A 100-char unknown wire 'type' must not crash the parser, and any
+        reply must satisfy the ERROR schema (ref_type clamped or absent)."""
+        coord_tmp = self.tmp("coord")
+        peer = ManualPeer(_identity(self.tmp("peer"), "peer"))
+        self.addCleanup(peer.stop)
+        node, addr = self.start_coordinator(coord_tmp, [peer.identity.node_id])
+        peer.connect(node.identity.node_id, addr)
+        peer.hello()
+        self.assertIsNotNone(peer.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 5.0))
+
+        # A well-formed envelope whose "type" was replaced by a hostile
+        # 100-char string. The parse pipeline fails at the type gate
+        # (UNSUPPORTED_TYPE) before the signature, so the coordinator's
+        # parse-error reply path is what gets exercised.
+        framed = peer.craft(MessageType.PING, {"nonce": "boom"})
+        good = json.loads(framed[4:].decode("utf-8"))  # drop the 4-byte length header
+        good["type"] = "x" * 100
+        peer.send(encode_frame(json.dumps(good).encode("utf-8")))
+
+        errors_before = len(peer._errors)
+        error = peer.wait_for(lambda e: e.type is MessageType.ERROR, 5.0)
+        if error is not None:
+            # Reaching here already proves the reply parses (the recorder
+            # stores only schema-valid envelopes). The ref_type must be
+            # absent or a registered wire type -- never the hostile string.
+            self.assertEqual(error.body["code"], ErrorCode.UNSUPPORTED_TYPE.value)
+            ref_type = error.body.get("ref_type")
+            self.assertTrue(
+                ref_type is None or ref_type in {t.value for t in MessageType},
+                f"ref_type {ref_type!r} must be absent or a valid message type",
+            )
+        # Whether or not a reply arrived, the wire must never emit an
+        # ERROR that violates its own schema.
+        self.assertEqual(len(peer._errors), errors_before, "reply must be schema-valid")
+
 
 class ResilienceTests(NodeTestsBase):
     """Restart/disconnect behavior across real processes."""
@@ -843,6 +1034,19 @@ class ResilienceTests(NodeTestsBase):
             # Wait for the mirror write before the kill: the RESULT_ACK and
             # the worker's mirror append are two different instants.
             self._wait_mirror_count(worker_tmp, 1)
+            # The coordinator's per-peer seq window must be PERSISTED (not
+            # just claimed): node_state holds the worker's row with a
+            # positive last_seq_seen before the worker is killed.
+            coord_db = sqlite3.connect(str(coord_tmp / "coordinator.db"))
+            try:
+                seen_row = coord_db.execute(
+                    "SELECT last_seq_seen FROM node_state WHERE peer_id=?",
+                    (worker_identity.node_id,),
+                ).fetchone()
+            finally:
+                coord_db.close()
+            self.assertIsNotNone(seen_row, "node_state must persist the worker's seq window")
+            self.assertGreater(seen_row[0], 0)
         finally:
             stop_worker(worker)
 
@@ -906,6 +1110,59 @@ class ResilienceTests(NodeTestsBase):
             worker.wait(10.0)
             coordinator.terminate()
             coordinator.wait(10.0)
+
+    def test_worker_seq_regression_self_heals(self) -> None:
+        """A rolled-back seq.json must not wedge the worker forever: the
+        coordinator's SEQ_OUT_OF_WINDOW error carries the persisted
+        last_seen, and the worker jumps past it and reconnects."""
+        coord_tmp = self.tmp("coord")
+        worker_tmp = self.tmp("worker")
+        client_tmp = self.tmp("client")
+        coord_identity, worker_identity, client_identity, coord_addr, coordinator = self._setup_subprocesses(
+            coord_tmp, worker_tmp, client_tmp
+        )
+        self.addCleanup(coordinator.wait, 10.0)
+        self.addCleanup(coordinator.terminate)
+
+        client = Node(_client_config(client_tmp, coord_identity.node_id, coord_addr))
+        self.addCleanup(client.shutdown)
+
+        worker = _spawn_node(worker_tmp / "worker.json")
+        try:
+            ack = client.client_create_task({"numbers": [3]}, timeout=15.0)
+            status = self._wait_validated(client, ack["task_id"])
+            self.assertEqual(status["credits_count"], 1)
+            self._wait_mirror_count(worker_tmp, 1)
+            # Precondition: the coordinator has a persisted window for the
+            # worker, so a rolled-back worker seq IS behind on restart.
+            coord_db = sqlite3.connect(str(coord_tmp / "coordinator.db"))
+            try:
+                seen = coord_db.execute(
+                    "SELECT last_seq_seen FROM node_state WHERE peer_id=?",
+                    (worker_identity.node_id,),
+                ).fetchone()
+            finally:
+                coord_db.close()
+            self.assertIsNotNone(seen, "precondition: coordinator persists the worker window")
+            self.assertGreater(seen[0], 0)
+        finally:
+            worker.terminate()
+            worker.wait(10.0)
+
+        # Roll the worker's send-seq back to zero (simulates a lost disk /
+        # restored backup): its next HELLO is behind the coordinator's
+        # window and would be rejected as a replay -- unless the worker
+        # self-heals from the SEQ_OUT_OF_WINDOW error.
+        (worker_tmp / "seq.json").unlink(missing_ok=True)
+
+        worker = _spawn_node(worker_tmp / "worker.json")
+        try:
+            ack = client.client_create_task({"numbers": [4, 4]}, timeout=15.0)
+            status = self._wait_validated(client, ack["task_id"], timeout=45.0)
+            self.assertEqual(status["credits_count"], 1)
+        finally:
+            worker.terminate()
+            worker.wait(10.0)
 
     def _wait_validated(self, client: Node, task_id: str, timeout: float = 30.0) -> dict:
         deadline = time.monotonic() + timeout

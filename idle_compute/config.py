@@ -209,6 +209,15 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
         raise ValidationError(f"coordinator_node_id is required for role {role!r}")
     if role == "coordinator" and coordinator_node_id is not None:
         raise ValidationError("coordinator_node_id must be absent for role 'coordinator'")
+    # Symmetric default-deny (audit finding, node.py:363): a worker/client
+    # whose peers list omits the coordinator would silently kill its OWN
+    # dialed stream during the mutual HELLO and retry forever. Fail fast at
+    # config load instead of shipping a never-connecting node.
+    if role in ("worker", "client") and coordinator_node_id not in peers:
+        raise ValidationError(
+            "coordinator_node_id must be listed in peers for role "
+            f"{role!r} (symmetric default-deny)"
+        )
 
     coordinator_addr = raw.get("coordinator_addr")
     if coordinator_addr is not None and not isinstance(coordinator_addr, str):
@@ -286,7 +295,9 @@ class NodeConfig:
     """Validated node configuration; build via ``from_dict``/``load_config``.
 
     ``peers`` default-deny: an empty list means nobody may talk to this node
-    until a HELLO arrives from a listed peer id.
+    until a HELLO arrives from a listed peer id. For worker/client roles the
+    coordinator node id must itself be listed (the dialed stream is bound by
+    the same allowlist).
     """
 
     role: str

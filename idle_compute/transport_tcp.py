@@ -145,6 +145,10 @@ class TcpTransport(NetTransport):
         self._handler: Optional[_StreamHandler] = None
         self._pool: dict[str, _Conn] = {}  # dialed conns, keyed by peer_id
         self._live: set[socket.socket] = set()  # every open conn, for stop()
+        # One handler thread per connection: cap concurrent streams so a
+        # flood of accepted connections cannot spawn unbounded threads
+        # (audit finding transport_tcp.py:322).
+        self._max_streams = 64
 
     # -- NetTransport contract -------------------------------------------
 
@@ -312,7 +316,8 @@ class TcpTransport(NetTransport):
             with self._lock:
                 handler = self._handler
                 stopped = self._stopped
-            if handler is None or stopped:
+                over_limit = len(self._live) >= self._max_streams
+            if handler is None or stopped or over_limit:
                 _quiet_close(sock)
                 continue
             # Placeholder peer id by design (WAVE 1): the transport relays

@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -211,13 +212,22 @@ class Node:
 
         # Seq state: sent seq persists to disk; the coordinator also
         # persists per-peer seen-seq in node_state via the aux connection.
+        # Persistence is allowlist-gated: unknown senders never get past
+        # HELLO, so recording their window would only grow node_state from
+        # hostile input (audit finding node.py:347). Their frames are still
+        # window-checked in memory for the lifetime of the process.
         self._seq_file = self._data_dir / "seq.json"
         self._seq_lock = threading.Lock()
         self._send_seq = self._load_seq()
+        self._allowlisted = set(self.config.peers)
         if config.role == "coordinator" and self._aux is not None:
-            self._seq_window = SeqWindow(load=self._seen_load, save=self._seen_save)
+            self._seq_window = SeqWindow(
+                load=self._seen_load,
+                save=self._seen_save,
+                keep=self._allowlisted.__contains__,
+            )
         else:
-            self._seq_window = SeqWindow()
+            self._seq_window = SeqWindow(keep=self._allowlisted.__contains__)
 
         self._replies = _ReplyBuffer()
         self._work: queue.Queue[tuple[Any, Any]] = queue.Queue(maxsize=WORK_QUEUE_SIZE)
@@ -249,15 +259,30 @@ class Node:
             return self._send_seq
 
     def _seen_load(self, peer_id: str) -> int:
-        row = self._aux_query("SELECT last_seq_seen FROM node_state WHERE peer_id=?", (peer_id,))
+        # Allowlist gate: unknown senders are rejected at HELLO anyway, so
+        # their window never needs (or gets) a persisted row.
+        if peer_id not in self._allowlisted:
+            return 0
+        try:
+            row = self._aux_query("SELECT last_seq_seen FROM node_state WHERE peer_id=?", (peer_id,))
+        except sqlite3.Error:
+            logger.warning("node_state read failed; replay window resets for %s", peer_id[:12])
+            return 0
         return int(row[0]) if row else 0
 
     def _seen_save(self, peer_id: str, seq: int) -> None:
-        self._aux_execute(
-            "INSERT INTO node_state(peer_id,last_seq_seen) VALUES (?,?) "
-            "ON CONFLICT(peer_id) DO UPDATE SET last_seq_seen=excluded.last_seq_seen",
-            (peer_id, seq),
-        )
+        if peer_id not in self._allowlisted:
+            return
+        try:
+            self._aux_execute(
+                "INSERT INTO node_state(peer_id,last_seq_seen) VALUES (?,?) "
+                "ON CONFLICT(peer_id) DO UPDATE SET last_seq_seen=excluded.last_seq_seen",
+                (peer_id, seq),
+            )
+        except sqlite3.Error:
+            # Persistence is best-effort: a failed save must never kill the
+            # handler thread that is mid-parse.
+            logger.warning("node_state write failed for %s", peer_id[:12])
 
     def _aux_query(self, sql: str, params: tuple = ()) -> Any:
         with self._aux_lock:
@@ -344,9 +369,14 @@ class Node:
             if frame is None:
                 return
             try:
+                # Libp2p hands us the authenticated transport peer id (muxed
+                # conn identity), so the BAD_SENDER stage runs BEFORE the
+                # signature check there. TCP's placeholder ("tcp:host:port")
+                # is not a node id, so TCP keeps binding-after-parse by
+                # design (no transport-level peer auth exists).
                 env = parse_message(
                     frame,
-                    transport_peer_id=None,
+                    transport_peer_id=transport_peer if is_valid_node_id(transport_peer) else None,
                     verifier=NodeIdentity.verify_signature,
                     seq_window=self._seq_window,
                 )
@@ -354,6 +384,16 @@ class Node:
                 self._on_parse_error(exc, frame, write)
                 continue
             if bound is None:
+                if env.type is MessageType.ERROR:
+                    # An ERROR can legitimately precede the mutual HELLO:
+                    # our own first frame may have been rejected before the
+                    # handshake (e.g. SEQ_OUT_OF_WINDOW after a rolled-back
+                    # seq.json). Route it to the reply buffer so _await can
+                    # act on it (seq self-heal); the stream stays unbound
+                    # and still demands HELLO before anything else.
+                    if not self._on_envelope(env, write):
+                        return
+                    continue
                 if env.type is not MessageType.HELLO:
                     self._reply_error(write, ErrorCode.UNAUTHORIZED, "HELLO required as first frame", env)
                     return
@@ -392,6 +432,13 @@ class Node:
         sender = raw.get("sender")
         if not is_valid_node_id(sender):
             return
+        raw_type = raw.get("type")
+        try:
+            ref_type = MessageType(raw_type).value if isinstance(raw_type, str) else None
+        except ValueError:
+            # The wire type is not a registered message type: echoing it
+            # would violate the ERROR schema's ref_type bound, so omit it.
+            ref_type = None
         try:
             reply = error_envelope(
                 exc.code,
@@ -401,7 +448,7 @@ class Node:
                 recipient=sender,
                 seq=self._next_seq(),
                 in_reply_to=raw.get("seq") if isinstance(raw.get("seq"), int) else None,
-                ref_type=raw.get("type") if isinstance(raw.get("type"), str) else None,
+                ref_type=ref_type,
             )
             self._write_frame(write, encode_envelope(reply))
         except Exception:
@@ -420,6 +467,10 @@ class Node:
         if self.config.role == "coordinator":
             # Handshake/heartbeat acknowledgments carry nothing actionable.
             if env.type in (MessageType.HELLO_ACK, MessageType.PONG):
+                return True
+            # Never answer an ERROR with an ERROR: two coordinators doing so
+            # would echo REJECTED frames back and forth without bound.
+            if env.type is MessageType.ERROR:
                 return True
             if env.type in _COORD_HANDLED:
                 try:
@@ -493,7 +544,12 @@ class Node:
     def _handle_claim_request(self, env: Any, write: Callable[[bytes], None]) -> None:
         claim_request_id = env.body["claim_request_id"]
         # Idempotent replay: a retried CLAIM_REQUEST with a known id gets the
-        # SAME lease back (claims table), never a second one.
+        # SAME lease back (claims table), never a second one. A known id
+        # NEVER mints a fresh lease: the worker generates a new id per claim
+        # cycle, so the only caller of a remap path would be an attacker
+        # replaying a stolen id to mint leases on queued tasks (audit
+        # finding node.py:503). Known id + (missing/expired/foreign lease)
+        # is simply denied.
         lease: Lease | None = None
         row = self._aux_query(
             "SELECT lease_id FROM claims WHERE claim_request_id=?", (claim_request_id,)
@@ -507,23 +563,17 @@ class Node:
             ):
                 lease = existing
         if lease is None:
-            lease = self._store.claim_task(env.sender, env.body["task_id"])
-            if lease is not None:
-                # Upsert (not OR IGNORE): a replay of a claim whose original
-                # lease has since expired must remap to the new lease, so the
-                # next replay returns the SAME lease instead of minting
-                # another one.
-                self._aux_execute(
-                    "INSERT INTO claims(claim_request_id,lease_id,task_id,worker_id,created_at) "
-                    "VALUES (?,?,?,?,?) "
-                    "ON CONFLICT(claim_request_id) DO UPDATE SET "
-                    "lease_id=excluded.lease_id, task_id=excluded.task_id, "
-                    "worker_id=excluded.worker_id, created_at=excluded.created_at",
-                    (claim_request_id, lease.lease_id, lease.task_id, env.sender, utc_now()),
-                )
-        if lease is None:
-            self._reply(write, MessageType.CLAIM_DENIED, {"claim_request_id": claim_request_id}, env)
-            return
+            if row is None:
+                lease = self._store.claim_task(env.sender, env.body["task_id"])
+                if lease is not None:
+                    self._aux_execute(
+                        "INSERT OR IGNORE INTO claims(claim_request_id,lease_id,task_id,worker_id,created_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (claim_request_id, lease.lease_id, lease.task_id, env.sender, utc_now()),
+                    )
+            if lease is None:
+                self._reply(write, MessageType.CLAIM_DENIED, {"claim_request_id": claim_request_id}, env)
+                return
         task = self._store.get_task(lease.task_id)
         if task is None:
             self._reply(write, MessageType.CLAIM_DENIED, {"claim_request_id": claim_request_id}, env)
@@ -564,6 +614,37 @@ class Node:
                 body["signature"],
             )
         except DuplicateSubmission:
+            # Idempotent replay: answer with the SAME RESULT_ACK the original
+            # submission earned, so a worker whose ack was lost still
+            # receives its credit event instead of stalling forever on a
+            # bare DUPLICATE error (audit finding node.py:566). No state
+            # changes happen on this path.
+            existing = self._store.get_result_by_lease(body["lease_id"])
+            if existing is not None and existing.peer_id == env.sender:
+                validation = self._store.get_validation(existing.result_id)
+                if validation is not None:
+                    credit = None
+                    if validation.status is ValidationStatus.VALID:
+                        credit = self._credit_row_for(existing.result_id)
+                        if credit is None:
+                            self._reply_error(write, ErrorCode.INTERNAL, "credit event missing", env)
+                            return
+                    self._reply(
+                        write,
+                        MessageType.RESULT_ACK,
+                        {
+                            "result_id": existing.result_id,
+                            "lease_id": existing.lease_id,
+                            "task_id": existing.task_id,
+                            "validation": (
+                                "VALID" if validation.status is ValidationStatus.VALID else "INVALID"
+                            ),
+                            "reason": validation.reason,
+                            "credit": credit,
+                        },
+                        env,
+                    )
+                    return
             self._reply_error(write, ErrorCode.DUPLICATE, "a result already exists for this lease", env)
             return
         except LeaseExpired:
@@ -610,15 +691,25 @@ class Node:
         )
 
     def _credit_row_for(self, result_id: str) -> dict[str, Any] | None:
-        """The credit event for a result, in export_since row format."""
-        for row in ledger.export_since(self._store.conn, 0):
-            try:
-                metadata = json.loads(row.get("metadata_json") or "{}")
-            except ValueError:
-                continue
-            if metadata.get("result_id") == result_id:
-                return row
-        return None
+        """The credit event for a result, in export_since row format.
+
+        export_since batches at MAX_SYNC_BATCH (100): paginate to the chain
+        head so a credit event beyond the first batch is still found (audit
+        finding node.py:614). Bounded by the ledger length.
+        """
+        after_seq = 0
+        while True:
+            rows = ledger.export_since(self._store.conn, after_seq)
+            if not rows:
+                return None
+            for row in rows:
+                try:
+                    metadata = json.loads(row.get("metadata_json") or "{}")
+                except ValueError:
+                    continue
+                if metadata.get("result_id") == result_id:
+                    return row
+            after_seq = rows[-1]["seq"]
 
     def _handle_status_request(self, env: Any, write: Callable[[bytes], None]) -> None:
         task_id = env.body["task_id"]
@@ -691,6 +782,7 @@ class Node:
     def run(self) -> int:
         """Run the configured role until SIGINT/stop; returns the exit code."""
         self._configure_logging()
+        self._loop_thread: threading.Thread | None = threading.current_thread()
         try:
             self._ensure_transport_started()
             if self.config.role == "coordinator":
@@ -741,13 +833,16 @@ class Node:
         while not self._stopping.is_set():
             try:
                 self._ensure_connected()
-                backoff = self.config.backoff_min
                 self._send_to(coordinator, MessageType.PING, {"nonce": new_id("png_")})
                 try:
                     self._claim_cycle(coordinator)
                 except NodeTimeoutError:
                     pass  # nothing claimable this round
                 self._stopping.wait(self.config.poll_interval_seconds)
+                # Reset only after a FULL healthy cycle: dial-then-fail
+                # loops must keep doubling, not reconnect at backoff_min
+                # forever (audit finding node.py:744).
+                backoff = self.config.backoff_min
             except (TransportError, NodeError) as exc:
                 logger.warning("worker link failed: %s", exc)
                 self._connected = False
@@ -762,7 +857,7 @@ class Node:
         addrs = self.transport.advertised_addrs() or [
             f"{self.config.listen_host}:{self.config.listen_port}"
         ]
-        self._send_to(
+        seq = self._send_to(
             coordinator,
             MessageType.HELLO,
             {"node_id": self.identity.node_id, "role": "worker", "listen_addrs": addrs[:1]},
@@ -770,35 +865,69 @@ class Node:
         self._await(
             lambda e: e.type is MessageType.HELLO_ACK and e.sender == coordinator,
             HELLO_ACK_TIMEOUT,
-            None,
+            seq,
         )
         self._connected = True
         logger.info("connected to coordinator %s", coordinator[:12])
 
     def _await(self, predicate: Callable[[Any], bool], timeout: float, sent_seq: int | None) -> Any:
         def match(env: Any) -> bool:
-            if env.type is MessageType.ERROR and sent_seq is not None and env.in_reply_to == sent_seq:
+            # A reply is only accepted for the message we actually sent:
+            # stale acks from an earlier timed-out handshake must never
+            # satisfy a later wait (audit findings node.py:770/771).
+            if sent_seq is not None and env.in_reply_to != sent_seq:
+                return False
+            if env.type is MessageType.ERROR:
                 return True
             return predicate(env)
 
         env = self._replies.wait(match, timeout)
         if env.type is MessageType.ERROR:
+            if env.body.get("code") == ErrorCode.SEQ_OUT_OF_WINDOW.value:
+                # Self-heal a rolled-back seq.json: jump past the peer's
+                # last_seen (it is in the error message) so the retried
+                # handshake is accepted instead of wedging forever.
+                self._recover_seq_from(env.body.get("message", ""))
             raise NodeRemoteError(env.body.get("message", "remote error"))
         return env
 
+    def _recover_seq_from(self, message: str) -> None:
+        match = re.search(r"last_seen (\d+)", message)
+        if match is None:
+            return
+        with self._seq_lock:
+            self._send_seq = max(self._send_seq, int(match.group(1)))
+            self._persist_seq()
+
     def _claim_cycle(self, coordinator: str) -> None:
         claim_request_id = new_id("crq_")
-        self._send_to(
+        seq = self._send_to(
             coordinator,
             MessageType.CLAIM_REQUEST,
             {"claim_request_id": claim_request_id, "task_id": None},
         )
-        env = self._await(
-            lambda e: e.type in (MessageType.CLAIM_GRANT, MessageType.CLAIM_DENIED)
-            and e.body["claim_request_id"] == claim_request_id,
-            float(self.config.poll_interval_seconds),
-            None,
-        )
+        claim_wait = float(self.config.poll_interval_seconds) * 2 + 2
+        try:
+            env = self._await(
+                lambda e: e.type in (MessageType.CLAIM_GRANT, MessageType.CLAIM_DENIED)
+                and e.body["claim_request_id"] == claim_request_id,
+                claim_wait,
+                seq,
+            )
+        except NodeTimeoutError:
+            # A grant that arrives while the worker was busy executing the
+            # previous task is not lost work: drain it once before the next
+            # claim cycle, so its lease (still ACTIVE until expiry) is used
+            # instead of burning a task attempt on an abandoned grant.
+            try:
+                env = self._await(
+                    lambda e: e.type in (MessageType.CLAIM_GRANT, MessageType.CLAIM_DENIED)
+                    and e.body["claim_request_id"] == claim_request_id,
+                    0.0,
+                    seq,
+                )
+            except NodeTimeoutError:
+                return
         if env.type is MessageType.CLAIM_DENIED:
             return
         lease_body = env.body["lease"]
@@ -862,7 +991,7 @@ class Node:
         addrs = self.transport.advertised_addrs() or [
             f"{self.config.listen_host}:{self.config.listen_port}"
         ]
-        self._send_to(
+        seq = self._send_to(
             coordinator,
             MessageType.HELLO,
             {"node_id": self.identity.node_id, "role": "client", "listen_addrs": addrs[:1]},
@@ -870,7 +999,7 @@ class Node:
         self._await(
             lambda e: e.type is MessageType.HELLO_ACK and e.sender == coordinator,
             HELLO_ACK_TIMEOUT,
-            None,
+            seq,
         )
         self._connected = True
 
@@ -938,6 +1067,14 @@ class Node:
             self.transport.stop()
         except Exception as exc:
             logger.debug("transport stop failed: %s", exc)
+        # Drain the role loop BEFORE closing its connections: sqlite3 conns
+        # belong to the loop thread, and closing them under a live
+        # transaction races the thread that uses them (audit finding
+        # node.py:941). The loop wakes on _stopping within one poll
+        # interval.
+        loop_thread = getattr(self, "_loop_thread", None)
+        if loop_thread is not None and loop_thread is not threading.current_thread():
+            loop_thread.join(timeout=self.config.poll_interval_seconds + 1.0)
         for closer in (self._store, self._mirror, self._aux):
             try:
                 if closer is not None:
