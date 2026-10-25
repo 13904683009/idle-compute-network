@@ -28,7 +28,7 @@
 | ID | 任务 | 负责人 | 状态 | 验收标准 | 证据 |
 | --- | --- | --- | --- | --- | --- |
 | C-1 | net_transport.py Libp2pTransport 适配器 + 双真实进程冒烟 + 导入遏制测试 | 待定 | todo | 依赖钉版核对；两个独立进程经 PeerInfo+临时端口+addr 文件交接回环互发 PING/PONG；stream.muxed_conn.peer_id 解析远程对等方；帧编解码单测无 libp2p；libp2p 仅出现在 identity.py+net_transport.py；无 asyncio | — |
-| C-2 | protocol.py：信封、帧编解码、封闭类型注册表、先验签后解析管线 | 待定 | todo | 信封金标准哈希；域 'idle-compute-node-msg-v2'；seq 窗口 (last_seen, last_seen+4096]；ts ±300/600s；先验签后解析顺序可观测；65537 字节帧不分配缓冲即拒；16 个 ERROR 码；JSON 深度 17 拒 | — |
+| C-2 | protocol.py：信封、帧编解码、封闭类型注册表、先验签后解析管线 | 主循环 | done | 信封金标准哈希；域 'idle-compute-node-msg-v2'；seq 窗口 (last_seen, last_seen+4096]；ts ±300/600s；先验签后解析顺序可观测；65537 字节帧不分配缓冲即拒；16 个 ERROR 码；JSON 深度 17 拒 | tests/test_protocol.py 45/45 绿；金标准 log 见 logs/idle-compute/phase2-C-golden.log |
 | C-3 | config.py + node.py 运行时 + HELLO/HELLO_ACK/PING/PONG + 白名单 + rendezvous 文件 | 待定 | todo | 配置校验（未知键/重复 db_path/畸形 node_id）；trio 版本启动断言；三真实进程 HELLO 互见；无 mDNS/UPnP/DHT；未列名单 HELLO→UNAUTHORIZED；PING→PONG；SIGINT 2 秒内退出码 0；坏签名 HELLO 丢弃 | — |
 | C-4 | transport_tcp.py 纯标准库 TCP 回退模块（单模块应急预案） | 待定 | todo | 与 LocalLoopbackTransport 同契约测试（真实子进程回环）；零非标准库导入；compileall 通过；ARCHITECTURE.md 记录为一行开关可切换 | — |
 
