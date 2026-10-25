@@ -1,0 +1,6 @@
+[project]
+name = "idle-compute-network"
+version = "0.1.0"
+description = "Local, whitelist-only idle compute network MVP"
+requires-python = ">=3.11"
+dependencies = []
