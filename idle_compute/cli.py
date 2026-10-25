@@ -17,9 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from .coordinator import Coordinator
+from .config import load_config
 from .db import DuplicateSubmission, DuplicateValidation, LeaseExpired, StoreError, TaskUnavailable
 from .identity import NodeIdentity, is_valid_node_id
 from .ledger import LedgerError
+from .node import Node, NodeError
 from .state_machine import InvalidTransition
 from .tasks import InvalidTaskInput
 
@@ -96,6 +98,47 @@ def cmd_peers_list(args: argparse.Namespace) -> int:
     config = _read_config(Path(args.config))
     _print({"peers": config.get("peers", {})})
     return 0
+
+
+# ---- node commands (--config only, never --db/--key) ----
+
+
+def cmd_node_run(args: argparse.Namespace) -> int:
+    """Run one configured network node (coordinator/worker/client serve)."""
+    node = Node(load_config(args.config))
+    return node.run()
+
+
+def cmd_node_create_task(args: argparse.Namespace) -> int:
+    node = Node(load_config(args.config))
+    try:
+        ack = node.client_create_task(
+            {"numbers": _parse_numbers(args.numbers)},
+            max_attempts=args.max_attempts,
+            lease_seconds=args.lease_seconds,
+        )
+        _print(ack)
+        return 0
+    finally:
+        node.shutdown()
+
+
+def cmd_node_status(args: argparse.Namespace) -> int:
+    node = Node(load_config(args.config))
+    try:
+        _print(node.client_status(args.task_id))
+        return 0
+    finally:
+        node.shutdown()
+
+
+def cmd_node_ping(args: argparse.Namespace) -> int:
+    node = Node(load_config(args.config))
+    try:
+        _print(node.client_ping())
+        return 0
+    finally:
+        node.shutdown()
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -283,6 +326,29 @@ def build_parser() -> argparse.ArgumentParser:
     peers_list.add_argument("--config", default="var/node/node.json", help="node config JSON path")
     peers_list.set_defaults(func=cmd_peers_list)
 
+    node = sub.add_parser("node", help="run or drive a real network node (Phase C)")
+    node_sub = node.add_subparsers(dest="node_command", required=True)
+
+    node_run = node_sub.add_parser("run", help="run this node's role until SIGINT")
+    node_run.add_argument("--config", default="var/node/node.json", help="node config JSON path")
+    node_run.set_defaults(func=cmd_node_run)
+
+    node_create = node_sub.add_parser("create-task", help="create one whitelisted task on the coordinator")
+    node_create.add_argument("--config", default="var/node/node.json", help="node config JSON path")
+    node_create.add_argument("--numbers", required=True, help="comma-separated integers")
+    node_create.add_argument("--max-attempts", type=int, default=3)
+    node_create.add_argument("--lease-seconds", type=int, default=30)
+    node_create.set_defaults(func=cmd_node_create_task)
+
+    node_status = node_sub.add_parser("status", help="query one task's status on the coordinator")
+    node_status.add_argument("--config", default="var/node/node.json", help="node config JSON path")
+    node_status.add_argument("--task-id", required=True)
+    node_status.set_defaults(func=cmd_node_status)
+
+    node_ping = node_sub.add_parser("ping", help="PING/PONG the coordinator")
+    node_ping.add_argument("--config", default="var/node/node.json", help="node config JSON path")
+    node_ping.set_defaults(func=cmd_node_ping)
+
     return parser
 
 
@@ -294,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     # TypeError and sqlite3.Error cover malformed persisted rows (e.g. NULL
     # tampering) and database-level failures (corrupt/locked DB) so they
     # surface as structured JSON errors instead of raw tracebacks.
-    except (InvalidTaskInput, StoreError, LedgerError, InvalidTransition, DuplicateSubmission, DuplicateValidation, LeaseExpired, TaskUnavailable, ValueError, TypeError, sqlite3.Error) as exc:
+    except (InvalidTaskInput, StoreError, LedgerError, InvalidTransition, DuplicateSubmission, DuplicateValidation, LeaseExpired, TaskUnavailable, NodeError, ValueError, TypeError, sqlite3.Error) as exc:
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False), file=sys.stderr)
         return 2
 

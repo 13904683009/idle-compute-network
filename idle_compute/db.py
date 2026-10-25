@@ -521,14 +521,18 @@ class Store:
             lease = self.get_lease(lease_id)
             if not lease or lease.peer_id != peer_id:
                 raise TaskUnavailable("lease not found for this peer")
-            if lease.status is not LeaseStatus.ACTIVE or _is_expired(lease.expires_at, now):
-                self.conn.execute("UPDATE leases SET status=? WHERE lease_id=?", (LeaseStatus.EXPIRED.value, lease_id))
-                raise LeaseExpired("lease expired before submission")
+            # Duplicate check BEFORE the lease-status check: after validation
+            # the lease is RELEASED, so a replayed submission must still be
+            # answered as a duplicate (idempotent replay), never as an
+            # expired lease. No state changes happen on this path.
             existing_result = self.conn.execute(
                 "SELECT result_id FROM results WHERE lease_id=?", (lease_id,)
             ).fetchone()
             if existing_result:
                 raise DuplicateSubmission("a result already exists for this lease")
+            if lease.status is not LeaseStatus.ACTIVE or _is_expired(lease.expires_at, now):
+                self.conn.execute("UPDATE leases SET status=? WHERE lease_id=?", (LeaseStatus.EXPIRED.value, lease_id))
+                raise LeaseExpired("lease expired before submission")
             task = self.get_task(lease.task_id)
             if not task:
                 raise TaskUnavailable("task not found")

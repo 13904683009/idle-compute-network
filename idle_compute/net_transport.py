@@ -143,7 +143,9 @@ class Libp2pTransport(NetTransport):
     ``start()`` is idempotent (second call is a no-op); ``stop()`` is
     idempotent and safe from any thread; ``dial()``/``send()`` raise
     TransportError on failure. Outbound streams are reused per peer and
-    recreated after a failure.
+    recreated after a failure. A dialed outbound stream is served like an
+    inbound one (handler on a fresh daemon thread), symmetric with
+    TcpTransport, so request/reply over one stream needs no reverse dial.
     """
 
     _START_TIMEOUT = 30.0  # seconds to wait for the host to be listening
@@ -372,11 +374,24 @@ class Libp2pTransport(NetTransport):
         except Exception as error:
             raise TransportError(f"invalid peer id {peer_id!r}: {error}") from error
         try:
-            return self._from_thread(self._open_stream, pid)
+            stream = self._from_thread(self._open_stream, pid)
         except TransportError as error:
             raise TransportError(
                 f"cannot open stream to peer {peer_id!r}: {error}"
             ) from error
+        # Contract symmetry with TcpTransport: a dialed outbound stream is
+        # served exactly like an inbound one — the handler gets a fresh
+        # daemon thread reading this stream, so replies from the peer reach
+        # the node layer without a second dial in reverse.
+        handler = self._handler
+        if handler is not None:
+            threading.Thread(
+                target=self._serve_stream,
+                args=(handler, peer_id, stream),
+                name="idle-compute-outbound",
+                daemon=True,
+            ).start()
+        return stream
 
     async def _open_stream(self, pid: ID) -> Any:
         try:

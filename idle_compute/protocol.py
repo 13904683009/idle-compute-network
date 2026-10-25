@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import struct
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -338,33 +339,38 @@ class SeqWindow:
         save: Callable[[str, int], None] | None = None,
     ) -> None:
         self._memory: dict[str, int] = {}
+        self._lock = threading.RLock()  # check_and_update nests a _last_seen call
         self._load = load
         self._save = save
 
     def _last_seen(self, peer_id: str) -> int:
-        if peer_id in self._memory:
-            return self._memory[peer_id]
-        value = self._load(peer_id) if self._load else 0
-        self._memory[peer_id] = value
-        return value
+        with self._lock:
+            if peer_id in self._memory:
+                return self._memory[peer_id]
+            value = self._load(peer_id) if self._load else 0
+            self._memory[peer_id] = value
+            return value
 
     def check_and_update(self, peer_id: str, seq: int) -> None:
-        if not isinstance(seq, int) or seq < 1:
-            raise ProtocolError(ErrorCode.SEQ_OUT_OF_WINDOW, f"invalid seq: {seq!r}")
-        last = self._last_seen(peer_id)
-        if seq <= last:
-            raise ProtocolError(
-                ErrorCode.SEQ_OUT_OF_WINDOW,
-                f"seq {seq} <= last_seen {last} for {peer_id[:12]}...",
-            )
-        if seq > last + SEQ_WINDOW:
-            raise ProtocolError(
-                ErrorCode.SEQ_OUT_OF_WINDOW,
-                f"seq {seq} beyond window {last + SEQ_WINDOW} for {peer_id[:12]}...",
-            )
-        self._memory[peer_id] = seq
-        if self._save:
-            self._save(peer_id, seq)
+        # Thread-safe: the node layer calls this from one handler thread per
+        # stream, so the check-then-record sequence must be atomic.
+        with self._lock:
+            if not isinstance(seq, int) or seq < 1:
+                raise ProtocolError(ErrorCode.SEQ_OUT_OF_WINDOW, f"invalid seq: {seq!r}")
+            last = self._last_seen(peer_id)
+            if seq <= last:
+                raise ProtocolError(
+                    ErrorCode.SEQ_OUT_OF_WINDOW,
+                    f"seq {seq} <= last_seen {last} for {peer_id[:12]}...",
+                )
+            if seq > last + SEQ_WINDOW:
+                raise ProtocolError(
+                    ErrorCode.SEQ_OUT_OF_WINDOW,
+                    f"seq {seq} beyond window {last + SEQ_WINDOW} for {peer_id[:12]}...",
+                )
+            self._memory[peer_id] = seq
+            if self._save:
+                self._save(peer_id, seq)
 
 
 # ---------------------------------------------------------------------------

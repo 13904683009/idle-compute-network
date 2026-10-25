@@ -79,19 +79,24 @@ def make_loop_echo(sink: list) -> callable:
     return handler
 
 
-def read_reply(transport: Libp2pTransport, peer_id: str, timeout=15.0):
-    """Read one echoed frame body from the caller's own outbound stream."""
-    stream = transport._streams[peer_id]
-    read = lambda n: transport._from_thread(stream.read, n)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            body = read_frame(read)
-        except Exception:
-            return None
-        if body is not None:
-            return body
-    return None
+def make_record_only(sink: list) -> callable:
+    """Handler: read one wire frame, record (peer_id, body), never echo.
+
+    Used on the dialer side now that dialed outbound streams are handler-
+    served like inbound ones (contract symmetry with TcpTransport).
+    """
+
+    def handler(peer_id: str, read, write) -> None:
+        while True:
+            try:
+                body = read_frame(read)
+            except Exception:
+                return
+            if body is None:
+                return
+            sink.append((peer_id, body))
+
+    return handler
 
 
 class TwoNodePairTests(unittest.TestCase):
@@ -145,7 +150,10 @@ class TwoNodePairTests(unittest.TestCase):
         ta, tb = self.transport_a, self.transport_b
         seen_a: list = []
         seen_b: list = []
-        ta.set_handler(make_loop_echo(seen_a))
+        # Dialer side records replies through its own handler (handler-served
+        # outbound streams); responder side echoes once. Record-only on the
+        # dialer prevents an echo storm between two loop-echo handlers.
+        ta.set_handler(make_record_only(seen_a))
         tb.set_handler(make_loop_echo(seen_b))
         # Local identity: transport peer id IS the identity's node id.
         self.assertEqual(ta.local_peer_id, self.identity_a.node_id)
@@ -157,21 +165,40 @@ class TwoNodePairTests(unittest.TestCase):
         self.assertEqual(info_b["protocol"], NETWORK_PROTOCOL_ID)
         ta.dial(tb.local_peer_id, [info_b["addr"]])
         ta.send(tb.local_peer_id, encode_frame(b"ping-from-a"))
-        self.assertEqual(read_reply(ta, tb.local_peer_id), b"ping-from-a")
+        wait_until(lambda: bool(seen_a), message="A's handler never saw the echo")
         wait_until(lambda: bool(seen_b), message="B never observed the inbound stream")
         # Identity binding: B's inbound handler saw A's node id.
         self.assertEqual(seen_b[0][0], ta.local_peer_id)
         self.assertEqual(seen_b[0][1], b"ping-from-a")
+        # A's own handler saw B's echo on A's dialed stream.
+        self.assertEqual(seen_a[0][0], tb.local_peer_id)
+        self.assertEqual(seen_a[0][1], b"ping-from-a")
         # Reverse direction through A's rendezvous file.
         info_a = read_rendezvous_file(self.addr_file_a)
         self.assertEqual(info_a["node_id"], ta.local_peer_id)
         tb.dial(ta.local_peer_id, [info_a["addr"]])
         tb.send(ta.local_peer_id, encode_frame(b"pong-from-b"))
-        self.assertEqual(read_reply(tb, ta.local_peer_id), b"pong-from-b")
-        wait_until(lambda: bool(seen_a), message="A never observed the inbound stream")
+        wait_until(lambda: len(seen_a) >= 2, message="A never observed the reverse frame")
         # Identity binding in the other direction.
+        self.assertEqual(seen_a[-1][0], tb.local_peer_id)
+        self.assertEqual(seen_a[-1][1], b"pong-from-b")
+
+    def test_outbound_stream_served_by_own_handler(self) -> None:
+        """Contract symmetry with TcpTransport: the dialer's own handler
+        receives replies on ITS dialed stream (no reverse dial, no
+        private-API reads) — the node layer's request/reply pattern."""
+        ta, tb = self.transport_a, self.transport_b
+        seen_a: list = []
+        tb.set_handler(make_loop_echo([]))
+        ta.set_handler(make_record_only(seen_a))
+        info_b = read_rendezvous_file(self.addr_file_b)
+        ta.dial(tb.local_peer_id, [info_b["addr"]])
+        ta.send(tb.local_peer_id, encode_frame(b"request-from-a"))
+        # A's own handler (fresh thread on the dialed stream) observes the
+        # echo — exactly how a node reads its peer's replies.
+        wait_until(lambda: bool(seen_a), message="A's handler never saw the echo")
         self.assertEqual(seen_a[0][0], tb.local_peer_id)
-        self.assertEqual(seen_a[0][1], b"pong-from-b")
+        self.assertEqual(seen_a[0][1], b"request-from-a")
 
     def test_start_twice_is_noop_and_transport_keeps_working(self) -> None:
         self.transport_a.start()
@@ -180,17 +207,16 @@ class TwoNodePairTests(unittest.TestCase):
         self.assertTrue(addrs)
         self.assertTrue(all(a.startswith("/ip4/127.0.0.1/tcp/") for a in addrs))
         seen: list = []
-        self.transport_b.set_handler(make_loop_echo(seen))
+        self.transport_b.set_handler(make_loop_echo([]))
+        self.transport_a.set_handler(make_record_only(seen))
         self.transport_a.dial(
             self.transport_b.local_peer_id, self.transport_b.advertised_addrs()
         )
         self.transport_a.send(
             self.transport_b.local_peer_id, encode_frame(b"after-noop-start")
         )
-        self.assertEqual(
-            read_reply(self.transport_a, self.transport_b.local_peer_id),
-            b"after-noop-start",
-        )
+        wait_until(lambda: bool(seen), message="echo never reached A's handler")
+        self.assertEqual(seen[0][1], b"after-noop-start")
 
     def test_oversized_100kb_frame_relayed_raw(self) -> None:
         # 100 KB exceeds protocol's 64 KiB cap: the transport must relay it
@@ -209,31 +235,39 @@ class TwoNodePairTests(unittest.TestCase):
             if got:
                 write(got)
 
+        seen_a: list = []
+
+        def record_all(peer_id: str, read, write) -> None:
+            got = b""
+            while len(got) < len(payload):
+                chunk = read(len(payload) - len(got))
+                if not chunk:
+                    break
+                got += chunk
+            seen_a.append((peer_id, got))
+
         self.transport_b.set_handler(raw_echo)
+        self.transport_a.set_handler(record_all)
         self.transport_a.dial(
             self.transport_b.local_peer_id, self.transport_b.advertised_addrs()
         )
         self.transport_a.send(self.transport_b.local_peer_id, payload)
-        stream = self.transport_a._streams[self.transport_b.local_peer_id]
-        got = b""
-        deadline = time.monotonic() + 20
-        while len(got) < len(payload) and time.monotonic() < deadline:
-            got += self.transport_a._from_thread(
-                stream.read, len(payload) - len(got)
-            )
-        self.assertEqual(got, payload)
+        wait_until(lambda: bool(seen_a), message="echo never reached A's handler")
+        self.assertEqual(seen_a[0][0], self.transport_b.local_peer_id)
+        self.assertEqual(seen_a[0][1], payload)
         wait_until(lambda: bool(seen), message="B never received the 100KB frame")
         self.assertEqual(seen[0][0], self.transport_a.local_peer_id)
         self.assertEqual(seen[0][1], payload)
 
     def test_concurrent_sends_from_two_threads_are_uncorrupted(self) -> None:
-        seen: list = []
-        self.transport_b.set_handler(make_loop_echo(seen))
+        seen_b: list = []
+        seen_a: list = []
+        self.transport_b.set_handler(make_loop_echo(seen_b))
+        self.transport_a.set_handler(make_record_only(seen_a))
         b_id = self.transport_b.local_peer_id
         self.transport_a.dial(b_id, self.transport_b.advertised_addrs())
         warm = b"warmup-frame"
         self.transport_a.send(b_id, encode_frame(warm))
-        self.assertEqual(read_reply(self.transport_a, b_id), warm)
         payloads = [b"A" * 16000, b"B" * 16000]
         errors: list = []
 
@@ -249,24 +283,26 @@ class TwoNodePairTests(unittest.TestCase):
         for thread in threads:
             thread.join()
         self.assertEqual(errors, [])
-        replies = [read_reply(self.transport_a, b_id), read_reply(self.transport_a, b_id)]
-        self.assertEqual(sorted(replies), sorted(payloads))
-        wait_until(lambda: len(seen) >= 3, message="B did not observe all three frames")
-        self.assertEqual(seen[0][1], warm)
-        self.assertEqual(sorted(body for _, body in seen[1:3]), sorted(payloads))
+        wait_until(lambda: len(seen_a) >= 3, message="A's handler did not see all three echoes")
+        self.assertEqual(sorted(body for _, body in seen_a), sorted([warm] + payloads))
+        wait_until(lambda: len(seen_b) >= 3, message="B did not observe all three frames")
+        self.assertEqual(seen_b[0][1], warm)
+        self.assertEqual(sorted(body for _, body in seen_b[1:3]), sorted(payloads))
 
     def test_outbound_stream_reused_per_peer(self) -> None:
-        seen: list = []
-        self.transport_b.set_handler(make_loop_echo(seen))
+        seen_a: list = []
+        self.transport_b.set_handler(make_loop_echo([]))
+        self.transport_a.set_handler(make_record_only(seen_a))
         b_id = self.transport_b.local_peer_id
         self.transport_a.dial(b_id, self.transport_b.advertised_addrs())
         self.transport_a.send(b_id, encode_frame(b"first"))
-        self.assertEqual(read_reply(self.transport_a, b_id), b"first")
+        wait_until(lambda: len(seen_a) >= 1, message="first echo never arrived")
         stream_one = self.transport_a._streams[b_id]
         self.transport_a.send(b_id, encode_frame(b"second"))
-        self.assertEqual(read_reply(self.transport_a, b_id), b"second")
+        wait_until(lambda: len(seen_a) >= 2, message="second echo never arrived")
         stream_two = self.transport_a._streams[b_id]
         self.assertIs(stream_one, stream_two)
+        self.assertEqual([body for _, body in seen_a], [b"first", b"second"])
 
 
 class TransportErrorTests(unittest.TestCase):

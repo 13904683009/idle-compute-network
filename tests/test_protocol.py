@@ -14,6 +14,7 @@ import json
 import os
 import struct
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -337,6 +338,26 @@ class TestSeqWindow(unittest.TestCase):
         self.assertEqual(saved, [(SENDER, 101)])
         with self.assertRaises(ProtocolError):
             parse_frame(frame_for(MessageType.PING, {"nonce": "n"}, seq=100), seq_window=window)
+
+    def test_thread_safety_concurrent_checkers(self):
+        window = SeqWindow()
+        accepted: list[int] = []
+
+        def hammer(start: int) -> None:
+            for seq in range(start, start + 100):
+                try:
+                    window.check_and_update(SENDER, seq)
+                    accepted.append(seq)
+                except ProtocolError:
+                    pass
+
+        threads = [threading.Thread(target=hammer, args=(s,)) for s in (1, 101)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sorted(accepted), list(range(1, 201)))
+        self.assertEqual(window._memory[SENDER], 200)
 
     def test_seq_zero_is_malformed_shape(self):
         frame = frame_for(MessageType.PING, {"nonce": "n"}, seq=0)
