@@ -1,6 +1,6 @@
 # 执行检查点 — 阶段 C（传输层与多节点通信）
 
-日期：2026-10-26（检查点记录于 WAVE 1 提交后、WAVE 2 审计进行中）
+日期：2026-10-26（检查点记录于审计修复轮 1 提交后）
 
 ## 已完成
 
@@ -13,23 +13,27 @@
   seq/租约持久化与重启恢复）；`cli.py` 新增 `node run/create-task/status/ping`；
   `db.py` submit_result 重复检查前移；tests/test_node.py 15 项真实多进程 E2E。
 - 全量回归：**244 测试全绿**（含 Phase 1 遗留 115 项，证明 db.py 重排安全）；compileall 通过。
+- 对抗审计（运行 wf_c4b211ee-5e6，4 维度 finders + 默认反驳 verifiers，28 代理）：
+  24 项发现 → 21 项确认（3 高 / 8 中 / 10 低）、2 项证伪、1 项默认证伪。
+- 修复轮 1（提交 `07e7fc2`）：21 项确认发现全部修复 + 回归测试。
+  关键修复：对称默认拒绝（worker/client 的 peers 必须含协调者，配置期即失败）；
+  SeqWindow 有界驱逐；seq 持久化 allowlist 门控 + 防御性失败；libp2p BAD_SENDER
+  实时生效；parse-error ref_type 钳制（敌意 type 字符串不再产出违反 schema 的 ERROR）；
+  协调者对 ERROR 永不回复；已知 claim id 不再铸新租约；同 peer 重复 SUBMIT →
+  原 RESULT_ACK 重放（幂等积分），异 peer → 不泄露信息的拒绝；积分导出分页；
+  _await 只接受所发消息的回复；SEQ_OUT_OF_WINDOW 自愈（回滚 seq.json 后自动跳变）；
+  未绑定流允许 ERROR 先于 HELLO（自愈消息可达等待者）；claim 等待 2×poll+2s +
+  零超时晚到清空；backoff 仅健康周期重置；shutdown 先 join 循环线程再关 DB；
+  双传输 64 并发流上限。修复后全量回归：**249 测试全绿**。
 - 文档：TASK-BOARD.md（C-1/C-3/C-4/D-1/D-2/D-3 已更新证据）、NODE-PROTOCOL.md、
-  TWO-DEVICE-TEST.md（标注待完成）。
-
-## 进行中
-
-- WAVE 2 对抗审计工作流（任务 wet57nhkt / 运行 wf_c4b211ee-5e6，4 维度 finders +
-  默认反驳的 adversarial verifiers）。产出处理后进入 ≤3 轮有界修复。
+  TWO-DEVICE-TEST.md（标注待完成）、C-REPORT.md。
 
 ## 待完成（按依赖顺序）
 
-1. 审计工作流完成 → 处理确认发现 → 修复轮（每轮后全量回归）→ 新提交（不 amend）。
-2. 测试证据日志归档（node E2E 日志）。
-3. `docs/phase2/C-REPORT.md`（交付报告：实现概览/架构协议/变更文件/逐测试结果/
-   244 含 115 旧测试/性能与安全上限/遗留风险/恢复步骤/阶段 D 建议）。
-4. 双设备验证：按 TWO-DEVICE-TEST.md 执行（未完成前保持"待完成"标记）。
-5. 最终交付报告给用户。
-6. 记忆文件更新（idle-compute-phase2.md）。
+1. 测试证据日志归档（node E2E 日志）。
+2. 双设备验证：按 TWO-DEVICE-TEST.md 执行（未完成前保持"待完成"标记）。
+3. 最终交付报告给用户。
+4. 记忆文件更新（idle-compute-phase2.md）。
 
 ## 硬约束（全程有效）
 
@@ -41,6 +45,7 @@
 
 ## 回滚点
 
-- `14cc40a`（WAVE 1 全量，244 绿）为当前安全里程碑。
-- 更早回退：`50fb629`（阶段 B 完成）、`e3e6d5a`（阶段 A 基线，57 测试）。
+- `07e7fc2`（审计修复轮 1，249 绿）为当前安全里程碑。
+- 更早回退：`14cc40a`（WAVE 1 全量，244 绿）、`50fb629`（阶段 B 完成）、
+  `e3e6d5a`（阶段 A 基线，57 测试）。
 - 备份 bundle 与分支信息见 docs/phase2/phase2-A-evidence.md §5。

@@ -27,6 +27,7 @@
 - `"tcp"` → `transport_tcp.py`：纯标准库 TCP（IPv4），`start()` 监听才生效（client 调 `start()` 会抛 `TransportError`——纯出站角色不监听）。
 - `"libp2p"` → `net_transport.py`：libp2p 适配器（多路复用流）；无 asyncio（libp2p 自身事件循环在线程内），外部契约与 TCP 相同（`connect/dial`、`read_frame/write_frame`、`close`、`start/stop`）。
 - 帧格式（`protocol.py`，两种传输共用）：4 字节大端长度 + JSON 信封；帧上限 64 KiB、体上限 32 KiB，超限在分配缓冲前拒绝。
+- 两种传输并发流上限 64（审计修复）：TCP 的 accept 循环与 libp2p 的流处理器在超限时直接关闭新流，不产生线程。
 
 导入遏制：libp2p 仅出现在 `identity.py` 与 `net_transport.py`（grep 验证）；`transport_tcp.py` 零非标准库导入。
 
@@ -55,6 +56,8 @@
 4. 收到 HELLO_ACK 即交换完成；之后双方在绑定的流上发业务消息。
 5. 已绑定流上重复 HELLO → 只回 HELLO_ACK 终止交换（幂等收尾）。
 6. 协调者收到 HELLO_ACK/PONG 静默丢弃（这些是拨号方期待的回应，协调者不作为拨号方时不应答）。
+7. **ERROR 允许先于 HELLO**：若本端首帧被对端解析期拒绝（如 seq.json 回滚后 HELLO 触发 `SEQ_OUT_OF_WINDOW`），对端的 ERROR 回复在未绑定流上被路由进回复缓冲（`_await` 可见，驱动 seq 自愈）；流保持未绑定，其余类型仍要求 HELLO 先到。
+8. **协调者对 ERROR 永不回复**（防回音风暴）；`_on_parse_error` 只在 sender 可解析时回 ERROR，且 `ref_type` 钳制为注册表内的合法类型（敌意 type 字符串不产出违反 schema 的回复）。
 
 未列名单 HELLO / 坏签名 HELLO / 畸形帧 / 超大帧 → 关流（可回 ERROR）。
 
@@ -65,8 +68,8 @@
 | HELLO / HELLO_ACK | 双向 | 流绑定（§4） |
 | PING / PONG | 双向 | 心跳/连通性 |
 | TASK_CREATE / TASK_CREATE_ACK | client→coord | 发布白名单任务（幂等：client_ref 重放返回同一 task_id） |
-| CLAIM_REQUEST / CLAIM_GRANT / CLAIM_DENIED | worker→coord | 领取任务；grant 内联 lease + task{type,payload}；denied 结束本轮 |
-| SUBMIT_RESULT / RESULT_ACK | worker→coord | 提交签名结果；ack 内联 `validation ∈ {VALID, INVALID}` 与 credit |
+| CLAIM_REQUEST / CLAIM_GRANT / CLAIM_DENIED | worker→coord | 领取任务；grant 内联 lease + task{type,payload}；denied 结束本轮；已知 claim_request_id 永不新铸租约（§6） |
+| SUBMIT_RESULT / RESULT_ACK | worker→coord | 提交签名结果；ack 内联 `validation ∈ {VALID, INVALID}` 与 credit；同 peer 重放→**原 RESULT_ACK 重放**（幂等积分）；异 peer→不泄露信息的拒绝（`TASK_UNAVAILABLE`） |
 | STATUS_REQUEST / STATUS_RESPONSE | client→coord | 查询任务状态（含 result/validation/credits_count） |
 | ERROR | 任意 | 16 种错误码，`in_reply_to` 指向触发消息的 seq |
 
@@ -77,11 +80,11 @@
 所有网络触发的状态变化都必须经过现有 `Store` 状态机：
 
 - TASK_CREATE：白名单校验 → `store.create_task`（仅 `numeric_batch_v1`，其他类型拒）。
-- CLAIM_REQUEST：`claims` 表 upsert（**ON CONFLICT DO UPDATE**）→ 重传/重放映射到同一条租约，绝不新铸租约；task 处于 `LEASED` 时先 `start_task` 推进到 `RUNNING`（否则后续 submit 会 `InvalidTransition`）→ CLAIM_GRANT。
-- SUBMIT_RESULT：**先查重复结果**（重放→`DUPLICATE`，不触碰租约状态）→ 租约校验（`LEASE_EXPIRED` / `TASK_UNAVAILABLE`）→ `validate_result`（独立重算 + 内容哈希 + HMAC/Ed25519 验签）→ VALID 才 `submit_result` 记账。
+- CLAIM_REQUEST：`claims` 表 **INSERT OR IGNORE**（审计修复：不再 upsert）→ 已知 claim_request_id 从不铸新租约：行已存在且租约仍 ACTIVE 且同 worker → 返回原租约；否则 CLAIM_DENIED；task 处于 `LEASED` 时先 `start_task` 推进到 `RUNNING`（否则后续 submit 会 `InvalidTransition`）→ CLAIM_GRANT。
+- SUBMIT_RESULT：**先查重复结果** → 同 worker 重放：回原 RESULT_ACK（含原 credit 事件，幂等，不改任何状态）；异 worker：租约归属门直接拒绝（`TASK_UNAVAILABLE`，不泄露结果是否存在）→ 租约校验（`LEASE_EXPIRED`）→ `validate_result`（独立重算 + 内容哈希 + HMAC/Ed25519 验签）→ VALID 才 `submit_result` 记账。
 - 记账：协调者按现有 ledger 哈希链写事件；工人镜像 `ledger_copy` 表，`ledger.verify_and_append`（逐事件验签 + 哈希链）通过才追加，`verified=1`。
 
-**失败任务不获得积分**（INVALID→无记账）、**重复任务不重复记分**（DUPLICATE→单记账）、**无效结果不进入已验证状态**——均有对抗测试覆盖（伪造结果、重复 claim、重复提交、错输出）。
+**失败任务不获得积分**（INVALID→无记账）、**重复任务不重复记分**（同 peer 重放→单记账）、**无效结果不进入已验证状态**——均有对抗测试覆盖（伪造结果、重复 claim、重复提交、异 peer 重放、错输出）。
 
 ## 7. 持久化与重启
 
@@ -94,13 +97,15 @@
 | node_state 表 | 每 sender 的 seq 窗口 | 重启后旧帧重放拒绝 |
 
 - 工人重启：seq 继续、过期租约由协调者 `expire_leases` 重新排队、恢复后重新 claim（第二任务被重启工人接走的测试覆盖）。
+- **seq 回滚自愈**（审计修复）：若 seq.json 丢失/回滚导致 HELLO 落后于协调者窗口，协调者回 `SEQ_OUT_OF_WINDOW`（消息含 `last_seen N`），工人解析后把出站 seq 跳到 N 并重试——不会永久卡死（测试：删除 seq.json 后第二个任务仍被验证）。
 - 协调者重启：工人 1..8s 退避重拨，重连后恢复轮询（coordinator-restart 测试覆盖）。
+- seq 持久化防御性处理：node_state 读写失败仅记日志（窗口退回内存态），永不杀死处理线程；仅白名单 peer 的窗口被持久化。
 - 线程亲和性：Store 与镜像连接各自**懒创建于所属 loop 线程**（sqlite3 连接绑定创建线程）；`_aux` 连接（node_state/claims/client_refs）`check_same_thread=False` + 锁，并在 `__init__` 里先 bootstrap 建 schema（处理线程可能先于 loop 查询）。
 
 ## 8. 资源与安全限制（现网值）
 
 - 帧 64 KiB / 体 32 KiB；JSON 深度 ≤16；工作队列 1024（满→OVERLOAD）。
-- seq 窗口 4096；时间戳 ±300s（握手 ±600s）；重试/退避 1..8s 封顶。
+- seq 窗口 4096；内存窗口有界（max_entries 1024，溢出时驱逐非白名单条目）；时间戳 ±300s（握手 ±600s）；重试/退避 1..8s 封顶。
 - 任务超时/租约时长由任务参数决定（默认 30s 租约、max_attempts 3）。
 - 网络默认监听**仅回环或显式配置的地址**；公网监听需独立安全评估与授权（本阶段未做）。
 - 密钥/HMAC 密钥/令牌：不写入日志、不出现在任何消息体、不入库（B-4 密钥永不打印测试）。
@@ -109,6 +114,8 @@
 ## 9. 已知边界（诚实声明）
 
 - `RESULT_ACK` 仅携带 VALID/INVALID；`ValidationStatus.REVIEW` 对白名单任务不会出现在线上。
-- TCP 传输仅 IPv4；libp2p 传输的 `start()` 对纯出站角色是 no-op（与 TCP 的抛错行为不对称，配置校验已约束角色与监听地址的组合）。
+- TCP 传输仅 IPv4；TCP 接听流的对端身份是占位符 `tcp:host:port`，身份绑定在解析成功后的 HELLO 完成（libp2p 有 muxed-conn 身份，`BAD_SENDER` 先于验签实时生效——两种传输的绑定时点不同，属设计取舍）。
+- libp2p 传输的 `start()` 对纯出站角色是 no-op（与 TCP 的抛错行为不对称，配置校验已约束角色与监听地址的组合）。
+- 对称默认拒绝：worker/client 的 `peers` 必须包含 `coordinator_node_id`，配置期即报错——缺省配置不再存在"拨号后自我断流"的死循环。
 - 双设备真实通信：单机多进程已验收；跨设备步骤文档（见 `TWO-DEVICE-TEST.md`）标注**待完成**，未宣称完成。
 - 洪泛令牌桶（F-1）、模糊测试（F-2）、线边界全套（F-3）、日志脱敏（F-4）按计划属阶段 F。

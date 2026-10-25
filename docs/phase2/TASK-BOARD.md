@@ -29,6 +29,10 @@
 > C-3 与 D-1/D-2/D-3 的应用协议核心合并进 `idle_compute/node.py` 单一运行时
 > （协调者 actor / 工人拉取循环 / client 一次性操作），以 15 项真实多进程 E2E
 > 测试（tests/test_node.py）验收。RENEW 续租与 LEDGER_SYNC 按原计划留在阶段 E/F。
+> 审计修复轮 1（提交 07e7fc2）：对抗审计（wf_c4b211ee-5e6）24 项发现中 21 项确认
+> 全部修复（对称默认拒绝 / 有界 seq 窗口 / claim 幂等不铸新租约 / 同 peer 重放原
+> RESULT_ACK / seq 回滚自愈 / ERROR 不回 / 流上限 64 / 等等），新增对抗回归测试，
+> 全量 **249 测试全绿**。
 
 | ID | 任务 | 负责人 | 状态 | 验收标准 | 证据 |
 | --- | --- | --- | --- | --- | --- |
@@ -44,9 +48,9 @@
 
 | ID | 任务 | 负责人 | 状态 | 验收标准 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| D-1 | 线上处理器（HELLO/CLAIM/SUBMIT/STATUS/PING/TASK_CREATE，node.py 协调者侧） | 主循环 | done | TASK_CREATE 先过白名单；CLAIM 幂等（重传同 lease，claims 表 upsert）；正确结果→RESULT_ACK VALID+内联签名记账；错输出→INVALID 无记账；重复提交→ERROR(DUPLICATE) 单记账；过期租约→重排队语义；全部状态转移经 Store 状态机（LEASED→RUNNING→SUBMITTED→VALIDATED） | tests/test_node.py：duplicate claim/submit、forged result、abandoned-lease requeue 等 9 项对抗测试绿 |
+| D-1 | 线上处理器（HELLO/CLAIM/SUBMIT/STATUS/PING/TASK_CREATE，node.py 协调者侧） | 主循环 | done | TASK_CREATE 先过白名单；CLAIM 幂等（已知 claim id 不铸新租约，INSERT OR IGNORE）；正确结果→RESULT_ACK VALID+内联签名记账；错输出→INVALID 无记账；同 peer 重复提交→原 RESULT_ACK 重放单记账、异 peer→TASK_UNAVAILABLE 不泄露；过期租约→重排队语义；全部状态转移经 Store 状态机（LEASED→RUNNING→SUBMITTED→VALIDATED） | tests/test_node.py：duplicate claim/submit、foreign replay、forged result、abandoned-lease requeue 等对抗测试绿；提交 07e7fc2 |
 | D-2 | 工人循环 + ledger_copy 镜像（claim/execute/sign/submit/backoff/resume，node.py 工人侧） | 主循环 | done | 以本节点密钥签 result-v2；credit 事件经 verify_and_append（验签+哈希链）后才入 ledger_copy；协调者死亡→1..8s 退避重拨；重启续跑（seq.json 持久化）；畸形 grant 不执行（schema 先校验） | tests/test_node.py：restart recovery、coordinator restart reconnect、mirror verified=1 断言绿 |
-| D-3 | cli.py node 命令 + 3 真实进程端到端幸福路径 | 主循环 | done | 真实多进程（协调者+工人子进程+client 驱动）：create-task 返回 task_id；工人执行提交；DB COMPLETED/恰 1 记账事件；status 显示 VALID+credits_count；第二任务被重启工人接走；杀工人→过期重排队→他人接走；244 测试全量回归绿 | tests/test_node.py 15/15（TCP 与 libp2p 双传输）；提交 14cc40a |
+| D-3 | cli.py node 命令 + 3 真实进程端到端幸福路径 | 主循环 | done | 真实多进程（协调者+工人子进程+client 驱动）：create-task 返回 task_id；工人执行提交；DB COMPLETED/恰 1 记账事件；status 显示 VALID+credits_count；第二任务被重启工人接走；杀工人→过期重排队→他人接走；seq.json 回滚后自愈；249 测试全量回归绿 | tests/test_node.py 15/15（TCP 与 libp2p 双传输）；提交 14cc40a + 07e7fc2 |
 
 ## 阶段 E（账本同步）
 
