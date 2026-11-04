@@ -137,4 +137,7 @@
   且**执行器一次都没有被调用**（测试用 instrumentation 证明）；深度 20 的 JSON 炸弹被丢弃，
   节点继续服务。源码级门禁同时锁定：libp2p 导入仅 `identity.py`/`net_transport.py`、
   包内无 `asyncio`、`TASK_TYPES` 只在 `tasks.py` 定义、Phase-2 运行时只经 `get_task_type` 取执行器。
-- 日志脱敏（F-4）按计划属阶段 F，尚未实现。
+- 日志脱敏（F-4，已验证）：node id 截断到 12 字符、哈希/签名截断到 8 字符、载荷只记
+  keys/计数、`*.key` 路径替换为 `<key-file>`；过滤器挂在 handler 上（logging 只在产生记录的
+  logger 上执行 logger 级 filter，传播时必须靠 handler 级 filter 兜底）。三进程 DEBUG
+  对抗运行（含未列名单 HELLO）捕获日志：无密钥字节、无 key 路径、无 128 hex 签名、无载荷值。

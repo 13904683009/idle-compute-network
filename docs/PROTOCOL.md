@@ -186,7 +186,7 @@ worker 每轮先 `LEDGER_SYNC_REQUEST{after_seq}` → 协调者回一页
 | 任务队列上限 | 1000 | 已实现 |
 | 每 peer 并发流 | 64 | 已实现（两种传输） |
 | 令牌桶 20 msg/s、突发 40；2 次触发 / 60 s → 关流 + 30 s 隔离 | 已实现（F-1，`ratelimit.py`；键为绑定后的 node_id） |
-| 日志脱敏 | — | **未实现**（F-4 计划） |
+| 日志脱敏：node id 12 字符 / 哈希与签名 8 字符 / 载荷只记计数 / key 路径 → `<key-file>` | 已实现（F-4，`log.py`；handler 级过滤器兜底） |
 
 ## 9. 发现与寻址
 

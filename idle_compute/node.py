@@ -56,6 +56,7 @@ from . import ledger
 from .config import NodeConfig, ValidationError, is_valid_node_id
 from .db import DuplicateSubmission, LeaseExpired, Store, TaskUnavailable
 from .identity import NodeIdentity
+from .log import install_redaction
 from .models import Lease, LeaseStatus, Task, TaskStatus, ValidationStatus, new_id, utc_now
 from .net_transport import (
     Libp2pTransport,
@@ -847,6 +848,9 @@ class Node:
             force=False,
         )
         logging.getLogger("idle_compute").setLevel(level)
+        # F-4: handler-level redaction covers every idle_compute.* record
+        # (a logger's own filters are not re-applied during propagation).
+        redaction = install_redaction(handlers=logging.getLogger().handlers)
         if not self.config.log_file:
             return
         # The file handler belongs to THIS node and is detached again in
@@ -861,6 +865,7 @@ class Node:
             return
         handler.setLevel(level)
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        handler.addFilter(redaction)
         logging.getLogger("idle_compute").addHandler(handler)
         self._log_handler = handler
 

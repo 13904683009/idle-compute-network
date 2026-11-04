@@ -75,7 +75,7 @@
 | **降级/混合签名方案**（hmac 行混入网络链） | 行级 `sig_algo` 标记；网络镜像只接受 `ed25519`，其余结构化 CONFLICT；网络协调者从空库起链 | `test_ledger.py::test_hmac_tagged_event_is_conflict`、`test_ledger_conflict.py` |
 | **网络窃听 / 中间人** | 应用层：信封 + 结果 + 记账三层 Ed25519 签名（端到端，不依赖链路）；传输层：**依赖 libp2p 默认 security transport，本项目未显式配置/验证** | 签名有测试；**不得声称链路已加密** |
 | **未授权节点接入** | 静态 `node_id` 白名单，默认拒绝（对称：worker/client 也校验协调者）；未列名单 HELLO → `UNAUTHORIZED` 关流 | `test_node.py::test_unauthorized_hello_rejected`、配置期对称校验 |
-| **Windows 密钥 ACL 限制** | 创建时显式 RuntimeWarning；密钥不进日志/消息/版本库；机密性依赖目录 ACL | `test_identity.py`、`test_crypto.py`（ACL 警告）、日志脱敏测试（**F-4 未实现**） |
+| **Windows 密钥 ACL 限制** | 创建时显式 RuntimeWarning；密钥不进日志/消息/版本库；机密性依赖目录 ACL | `test_identity.py`、`test_crypto.py`（ACL 警告）、`test_log.py`（三进程 DEBUG 捕获：无密钥字节/无 key 路径/无完整签名/无载荷值） |
 | **账本尾部删除** | 无外部锚点 → 检测不到合法前缀的尾删；工人镜像只能提供部分历史 | **剩余风险**，Phase 1 继承；`test_tail_deletion_is_not_detected_without_external_anchor` |
 | **协调者单点故障 / 单点作恶** | 工人可验证链完整性，但无共识、无多副本投票 → 协调者仍是唯一权威 | `docs/COORDINATION.md`（明确"不是共识"）；恢复依赖外部备份 |
 | **跨设备（LAN/WAN）未知性** | 未在两台物理设备上验证；时钟偏差/NAT/防火墙行为未知 | `docs/phase2/TWO-DEVICE-TEST.md` 状态"待完成" |
