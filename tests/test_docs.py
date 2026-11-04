@@ -116,11 +116,17 @@ class DocsHonestyTests(unittest.TestCase):
             "TWO-DEVICE-TEST.md must keep the 'not executed' status until it actually runs",
         )
 
-    def test_rate_limiting_is_not_claimed_as_done(self) -> None:
-        # F-1 is not implemented: the docs that describe limits must say so.
-        text = _read(DOCS / "COORDINATION.md") + _read(DOCS / "PROTOCOL.md")
-        self.assertIn("未实现", text)
-        self.assertIn("F-1", text)
+    def test_rate_limiting_limits_are_documented(self) -> None:
+        # F-1 is implemented: the limits must be stated with their numbers, and
+        # the docs must stay honest about what is still NOT done (F-2..F-4).
+        protocol = _read(DOCS / "PROTOCOL.md")
+        for marker in ("令牌桶", "20 msg/s", "突发 40", "30 s 隔离", "ratelimit.py"):
+            self.assertIn(marker, protocol, f"PROTOCOL.md must document {marker!r}")
+        self.assertIn("日志脱敏", protocol)
+        self.assertIn("未实现", protocol)
+        threat = _read(DOCS / "THREAT_MODEL.md")
+        self.assertNotIn("令牌桶 20 msg/s 未实现", threat, "the threat model must not stale-claim F-1 as missing")
+        self.assertIn("test_ratelimit.py", threat)
 
 
 if __name__ == "__main__":

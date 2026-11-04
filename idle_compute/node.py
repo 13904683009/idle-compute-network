@@ -75,6 +75,7 @@ from .protocol import (
     parse_message,
     read_frame,
 )
+from .ratelimit import PeerRateLimiter
 from .signing import Ed25519Policy
 from .tasks import InvalidTaskInput
 from .transport_tcp import TcpTransport
@@ -240,6 +241,11 @@ class Node:
 
         self._replies = _ReplyBuffer()
         self._work: queue.Queue[tuple[Any, Any]] = queue.Queue(maxsize=WORK_QUEUE_SIZE)
+        # F-1: per-peer ingress limit (20 msg/s, burst 40; 2 trips / 60 s ->
+        # close + 30 s quarantine). Keyed by the transport peer id: for libp2p
+        # that is the authenticated node id, for TCP the per-connection
+        # placeholder until HELLO binds the stream.
+        self._ratelimit = PeerRateLimiter()
         self._stopping = threading.Event()
         self._started = False
         self._connected = False
@@ -381,8 +387,12 @@ class Node:
     # ------------------------------------------------------ inbound stream
 
     def _on_stream(self, transport_peer: str, read: Callable[[int], bytes], write: Callable[[bytes], None]) -> None:
-        """One handler thread per stream: frame loop, parse, auth, dispatch."""
+        """One handler thread per stream: rate gate, frame loop, parse, auth, dispatch."""
         bound: str | None = None
+        if self._ratelimit.blocked(transport_peer):
+            # A quarantined peer never gets a handler loop: refuse and close.
+            logger.warning("refusing stream from quarantined peer %s", transport_peer[:12])
+            return
         while not self._stopping.is_set():
             try:
                 frame = read_frame(read)
@@ -390,6 +400,21 @@ class Node:
                 return  # framing broken (oversized/truncated): close stream
             if frame is None:
                 return
+            # F-1: account the frame BEFORE parsing/verification. Keyed by the
+            # bound node id once HELLO has run (so a TCP peer cannot dodge its
+            # quarantine by reconnecting), by the transport peer before that.
+            # Dropped frames are not answered (no amplification); a second trip
+            # within the window closes the stream.
+            decision = self._ratelimit.check(bound or transport_peer)
+            if not decision.allow:
+                if decision.close_stream:
+                    logger.warning(
+                        "rate limit: closing stream for %s (%s)", transport_peer[:12], decision.reason
+                    )
+                    self._reply_error(write, ErrorCode.OVERLOAD, "rate limited; stream closed", None)
+                    return
+                logger.debug("rate limit: dropped one frame from %s", transport_peer[:12])
+                continue
             try:
                 # Libp2p hands us the authenticated transport peer id (muxed
                 # conn identity), so the BAD_SENDER stage runs BEFORE the
@@ -424,6 +449,11 @@ class Node:
                     return
                 if env.sender not in self.config.peers:
                     self._reply_error(write, ErrorCode.UNAUTHORIZED, "sender not in allowlist", env)
+                    return
+                if self._ratelimit.blocked(env.sender):
+                    # The node id is quarantined: refuse the handshake so a TCP
+                    # reconnect cannot reset the bucket.
+                    self._reply_error(write, ErrorCode.OVERLOAD, "peer is rate limited", env)
                     return
                 bound = env.sender
                 # Mutual HELLO handshake: the dialer's gate also demands a

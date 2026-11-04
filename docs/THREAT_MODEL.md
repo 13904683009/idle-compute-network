@@ -69,7 +69,7 @@
 | --- | --- | --- |
 | **Ed25519 伪造身份**（冒充他人 node_id） | 身份 = 单一 Ed25519 密钥对；`node_id` 内嵌公钥；每条消息验签；传输层对端必须等于 `sender`（`BAD_SENDER`） | `tests/test_identity.py` 17 项、`test_protocol.py`、`test_node.py`（伪造 HELLO/异钥结果被拒） |
 | **信封重放** | 每 sender 持久化序号窗 `(last_seen, last_seen+4096]`；时间戳 ±300 s（>600 s 丢弃）；应用层幂等兜底 | `test_protocol.py`（窗口边界/超窗/`SEQ_OUT_OF_WINDOW` 自愈）、`test_node.py`（seq 回滚自愈、旧 ACK 重放不双记账） |
-| **消息洪泛 / 资源耗尽** | 帧 64 KiB、body 32 KiB、深度 16（分配前校验）；每 peer 64 并发流；协调者工作队列 1024 → `OVERLOAD`；任务队列上限 1000 | 已实现的前四项有测试；**令牌桶 20 msg/s 未实现（F-1）**，当前白名单内节点仍可高频发消息 |
+| **消息洪泛 / 资源耗尽** | 帧 64 KiB、body 32 KiB、深度 16（分配前校验）；每 peer 64 并发流；协调者工作队列 1024 → `OVERLOAD`；任务队列上限 1000；**每 peer 令牌桶 20 msg/s、突发 40，2 次触发/60 s → 关流 + 30 s 隔离**（F-1，键为绑定后的 node_id） | `test_ratelimit.py`（桶数学/触发/隔离/重连不可重置 + 真实洪泛被关流、其他 peer 不受影响）：洪泛仍可消耗有限带宽，但不再无限放大 |
 | **超大帧 / 畸形帧** | 长度前缀先校验再分配；截断/非法 JSON → 关流，节点存活 | `test_protocol.py`（65537 字节帧）、`test_node.py`（超大帧/垃圾帧后仍服务） |
 | **工人镜像被本地篡改** | 启动时从 `seq 0` 全链重审（分页可续）；每事件验签 + `prev_hash` 链 + 内容比对；分歧 → CONFLICT 停 claim，不回卷 | `tests/test_ledger_conflict.py`（篡改链在坏事件处停住、内容不一致冲突、hmac 行冲突） |
 | **降级/混合签名方案**（hmac 行混入网络链） | 行级 `sig_algo` 标记；网络镜像只接受 `ed25519`，其余结构化 CONFLICT；网络协调者从空库起链 | `test_ledger.py::test_hmac_tagged_event_is_conflict`、`test_ledger_conflict.py` |
