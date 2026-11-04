@@ -59,6 +59,32 @@ def _write_config(path: Path, config: dict[str, Any]) -> None:
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _normalize_peers_shape(config: dict[str, Any]) -> bool:
+    """Rewrite ``config`` in place to peers=list + directory (D2, ADR-D0-13).
+
+    Returns True when the legacy object form was migrated (roles/addrs are
+    preserved; nothing is dropped). The caller writes the new shape.
+    """
+    peers_raw = config.get("peers", [])
+    if isinstance(peers_raw, dict):
+        directory = dict(peers_raw)
+        if config.get("directory") is not None:
+            # One source of truth: explicit new-format values win, but legacy
+            # entries are merged in rather than dropped.
+            merged = dict(directory)
+            merged.update(config["directory"])
+            directory = merged
+        config["peers"] = list(peers_raw)
+        config["directory"] = directory
+        return True
+    if isinstance(peers_raw, list):
+        config.setdefault("directory", {})
+        return False
+    raise ValueError(
+        f"peers must be a list (or the legacy object form), got {type(peers_raw).__name__}"
+    )
+
+
 def _identity_path(config: dict[str, Any], config_path: Path) -> Path:
     return Path(config.get("identity_key", config_path.parent / "identity.key"))
 
@@ -82,21 +108,42 @@ def cmd_peers_add(args: argparse.Namespace) -> int:
         )
     config_path = Path(args.config)
     config = _read_config(config_path)
-    peers = config.setdefault("peers", {})
-    entry = peers.setdefault(args.node_id, {"role": args.role, "addrs": []})
+    migrated = _normalize_peers_shape(config)
+    peers = config.setdefault("peers", [])
+    if args.node_id not in peers:
+        peers.append(args.node_id)
+    directory = config.setdefault("directory", {})
+    entry = directory.get(args.node_id)
+    if not isinstance(entry, dict):
+        entry = {"role": args.role, "addrs": []}
+    directory[args.node_id] = entry
     entry["role"] = args.role
-    if args.addr:
-        addrs = entry.setdefault("addrs", [])
-        if args.addr not in addrs:
-            addrs.append(args.addr)
+    addrs = entry.get("addrs")
+    if not isinstance(addrs, list):
+        addrs = []
+    entry["addrs"] = addrs
+    if args.addr and args.addr not in addrs:
+        addrs.append(args.addr)
     _write_config(config_path, config)
-    _print({"peers": config["peers"]})
+    if migrated:
+        print(
+            json.dumps(
+                {
+                    "migration": "legacy 'peers' object rewritten as a node-id list + "
+                    "'directory' (roles and addrs preserved)"
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+    _print({"peers": peers, "directory": directory})
     return 0
 
 
 def cmd_peers_list(args: argparse.Namespace) -> int:
     config = _read_config(Path(args.config))
-    _print({"peers": config.get("peers", {})})
+    _normalize_peers_shape(config)
+    _print({"peers": config.get("peers", []), "directory": config.get("directory", {})})
     return 0
 
 

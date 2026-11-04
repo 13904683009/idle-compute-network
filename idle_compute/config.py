@@ -18,6 +18,14 @@ An EMPTY list means default-deny — nobody may talk to this node until a
 HELLO arrives from a listed peer id; there is no implicit trust of unknown
 callers.
 
+Peer metadata (D2, ADR-D0-13): ``directory`` optionally maps a node id to
+``{role, addrs}``. It is metadata only — the trust decision stays ``peers``.
+Every directory key must also be in ``peers`` so the file cannot describe a
+peer it does not allow. The legacy object form of ``peers`` (written by
+``peers add`` before D2) is still READ, migrated in memory (no role/addr is
+dropped) and reported through ``NodeConfig.migration_hint``; the writer always
+emits the list + directory shape.
+
 Public-listen authorization: a listen_host that is not loopback (127.0.0.1,
 anything in 127.0.0.0/8, ::1, localhost) requires ``allow_public_listen`` to
 be true. There is no silent default that would expose a node on a public
@@ -40,6 +48,8 @@ __all__ = [
     "ConfigError",
     "ValidationError",
     "NodeConfig",
+    "PeerDirectoryEntry",
+    "DiscoveryConfig",
     "from_dict",
     "load_config",
     "is_valid_node_id",
@@ -64,6 +74,9 @@ _DEFAULTS = {
     "allow_public_listen": False,
     "db_path": None,
     "peers": [],
+    "directory": {},
+    "capability": None,
+    "discovery": {},
     "coordinator_node_id": None,
     "coordinator_addr": None,
     "poll_interval_seconds": 5,
@@ -73,6 +86,55 @@ _DEFAULTS = {
     "log_file": None,
 }
 _FIELDS = frozenset(_DEFAULTS) | {"role", "data_dir"}
+
+# D2 (ADR-D0-13): ``peers`` is the allowlist (list of node ids); ``directory``
+# is optional metadata keyed by node id. The legacy object form of ``peers``
+# ({node_id: {role, addrs}}) is still READ (and migrated in memory with an
+# actionable hint) but never written again.
+_DIRECTORY_KEYS = frozenset({"role", "addrs"})
+_CAPABILITY_TEMPLATE_KEYS = frozenset(
+    {
+        "capability_version",
+        "ttl_seconds",
+        "supported_task_types",
+        "supported_runtimes",
+        "hardware",
+        "resource_limits",
+        "network",
+        "verification",
+        "available_resources",
+        "accepting_tasks",
+    }
+)
+_DISCOVERY_KEYS = frozenset(
+    {
+        "announce_interval_seconds",
+        "max_entries",
+        "max_announcement_ttl_seconds",
+        "offline_after_seconds",
+        "query_timeout_seconds",
+    }
+)
+
+
+@dataclass(frozen=True)
+class PeerDirectoryEntry:
+    """Metadata for one known peer (never the trust decision — that is peers)."""
+
+    role: str
+    addrs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    """Bounded discovery tunables (D2); defaults are the documented values."""
+
+    announce_interval_seconds: int = 20
+    max_entries: int = 1024
+    max_announcement_ttl_seconds: int = 120
+    offline_after_seconds: int = 90
+    query_timeout_seconds: int = 10
+
 
 
 class ConfigError(Exception):
@@ -131,6 +193,79 @@ def _require_int(
     if not low <= value <= high:
         raise ValidationError(f"{key} must be in {low}..{high}, got {value}")
     return value
+
+
+def _parse_capability_template(value: Any) -> dict[str, Any] | None:
+    """Validate the optional announcement template (D2).
+
+    Deep validation of the manifest fields happens when the node builds and
+    SIGNS a manifest (``discovery``/``capability`` modules); here we reject
+    unknown keys and the obviously broken shapes so a typo fails at startup.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError(f"capability must be an object or null, got {type(value).__name__}")
+    unknown = sorted(str(key) for key in value if key not in _CAPABILITY_TEMPLATE_KEYS)
+    if unknown:
+        raise ValidationError(f"capability has unknown key(s): {', '.join(unknown)}")
+    template = dict(value)
+    version = template.get("capability_version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValidationError("capability.capability_version must be an int >= 1")
+    ttl = template.get("ttl_seconds", 120)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 10 <= ttl <= 3600:
+        raise ValidationError("capability.ttl_seconds must be an int in 10..3600")
+    task_types = template.get("supported_task_types")
+    if not isinstance(task_types, list) or not task_types or not all(
+        isinstance(item, str) and 0 < len(item) <= 64 for item in task_types
+    ):
+        raise ValidationError("capability.supported_task_types must be a non-empty list of strings")
+    runtimes = template.get("supported_runtimes", [])
+    if not isinstance(runtimes, list) or not all(
+        isinstance(item, str) and 0 < len(item) <= 64 for item in runtimes
+    ):
+        raise ValidationError("capability.supported_runtimes must be a list of strings")
+    resources = template.get("available_resources", {"cpu_cores": 0, "ram_mb": 0, "gpu_memory_mb": 0})
+    if not isinstance(resources, dict) or set(resources) != {"cpu_cores", "ram_mb", "gpu_memory_mb"}:
+        raise ValidationError(
+            "capability.available_resources must have exactly cpu_cores, ram_mb, gpu_memory_mb"
+        )
+    for key, item in resources.items():
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValidationError(f"capability.available_resources.{key} must be an int >= 0")
+    if "accepting_tasks" in template and not isinstance(template["accepting_tasks"], bool):
+        raise ValidationError("capability.accepting_tasks must be a bool")
+    return template
+
+
+def _parse_discovery(value: Any) -> DiscoveryConfig:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValidationError(f"discovery must be an object, got {type(value).__name__}")
+    unknown = sorted(str(key) for key in value if key not in _DISCOVERY_KEYS)
+    if unknown:
+        raise ValidationError(f"discovery has unknown key(s): {', '.join(unknown)}")
+
+    def _int(key: str, low: int, high: int, default: int) -> int:
+        item = value.get(key, default)
+        if isinstance(item, bool) or not isinstance(item, int) or not low <= item <= high:
+            raise ValidationError(f"discovery.{key} must be an int in {low}..{high}")
+        return item
+
+    config = DiscoveryConfig(
+        announce_interval_seconds=_int("announce_interval_seconds", 5, 3600, 20),
+        max_entries=_int("max_entries", 1, 100_000, 1024),
+        max_announcement_ttl_seconds=_int("max_announcement_ttl_seconds", 10, 3600, 120),
+        offline_after_seconds=_int("offline_after_seconds", 10, 3600, 90),
+        query_timeout_seconds=_int("query_timeout_seconds", 1, 60, 10),
+    )
+    if config.offline_after_seconds <= config.announce_interval_seconds:
+        raise ValidationError(
+            "discovery.offline_after_seconds must be greater than announce_interval_seconds"
+        )
+    return config
 
 
 def from_dict(raw: dict[str, Any]) -> NodeConfig:
@@ -193,14 +328,77 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
             "ambiguous (db_path is only allowed when data_dir is empty)"
         )
 
+    # ---- peers + directory (D2, ADR-D0-13) --------------------------------
     peers_raw = raw.get("peers", _DEFAULTS["peers"])
+    directory_raw = raw.get("directory")
+    migration_hint: str | None = None
+    if isinstance(peers_raw, dict):
+        # Legacy form written by `peers add` before D2. Read it, keep every
+        # role/addr, and tell the operator how to migrate. Never written again.
+        if directory_raw is not None:
+            raise ValidationError(
+                "peers is the legacy object form AND directory is set: keep exactly one "
+                "source of peer metadata (rewrite peers as a list of node ids)"
+            )
+        directory_raw = peers_raw
+        peers_raw = list(peers_raw)
+        migration_hint = (
+            "legacy 'peers' object migrated to a node-id list plus 'directory'; "
+            "rewrite the file to the new shape (any `peers` or `identity` command does it)"
+        )
     if not isinstance(peers_raw, list):
-        raise ValidationError(f"peers must be a list of node ids, got {type(peers_raw).__name__}")
+        raise ValidationError(
+            f"peers must be a list of node ids (or the legacy object form), "
+            f"got {type(peers_raw).__name__}"
+        )
     peers: list[str] = []
     for index, peer in enumerate(peers_raw):
         if not is_valid_node_id(peer):
             raise _node_id_error(f"peers[{index}]", peer)
+        if peer in peers:
+            raise ValidationError(f"peers[{index}] duplicates an earlier node id")
         peers.append(peer)
+
+    directory: dict[str, PeerDirectoryEntry] = {}
+    if directory_raw is not None:
+        if not isinstance(directory_raw, dict):
+            raise ValidationError(
+                f"directory must be an object keyed by node id, got {type(directory_raw).__name__}"
+            )
+        for node_id, entry in directory_raw.items():
+            if not is_valid_node_id(node_id):
+                raise _node_id_error(f"directory key {node_id!r}", node_id)
+            if node_id not in peers:
+                raise ValidationError(
+                    f"directory[{node_id}] is not listed in peers: metadata must not "
+                    "describe a peer that is not in the allowlist"
+                )
+            if not isinstance(entry, dict):
+                raise ValidationError(
+                    f"directory[{node_id}] must be an object, got {type(entry).__name__}"
+                )
+            unknown_entry = sorted(str(key) for key in entry if key not in _DIRECTORY_KEYS)
+            if unknown_entry:
+                raise ValidationError(
+                    f"directory[{node_id}] has unknown key(s): {', '.join(unknown_entry)}"
+                )
+            entry_role = entry.get("role")
+            if entry_role not in _ROLES:
+                raise ValidationError(
+                    f"directory[{node_id}].role must be one of {', '.join(_ROLES)}, got {entry_role!r}"
+                )
+            addrs_raw = entry.get("addrs", [])
+            if not isinstance(addrs_raw, list) or not all(
+                isinstance(addr, str) and 0 < len(addr) <= 200 and not any(ch.isspace() for ch in addr)
+                for addr in addrs_raw
+            ):
+                raise ValidationError(
+                    f"directory[{node_id}].addrs must be a list of short address strings"
+                )
+            if len(addrs_raw) > 8:
+                raise ValidationError(f"directory[{node_id}].addrs accepts at most 8 entries")
+            directory[node_id] = PeerDirectoryEntry(role=entry_role, addrs=tuple(addrs_raw))
+
 
     coordinator_node_id = raw.get("coordinator_node_id")
     if coordinator_node_id is not None and not is_valid_node_id(coordinator_node_id):
@@ -251,6 +449,9 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
     if log_file is not None and not isinstance(log_file, str):
         raise ValidationError(f"log_file must be a string or null, got {type(log_file).__name__}")
 
+    capability = _parse_capability_template(raw.get("capability", _DEFAULTS["capability"]))
+    discovery = _parse_discovery(raw.get("discovery", _DEFAULTS["discovery"]))
+
     return NodeConfig(
         node_id=node_id,
         role=role,
@@ -261,6 +462,9 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
         data_dir=data_dir,
         db_path=db_path,
         peers=peers,
+        directory=directory,
+        capability=capability,
+        discovery=discovery,
         coordinator_node_id=coordinator_node_id,
         coordinator_addr=coordinator_addr,
         poll_interval_seconds=poll_interval_seconds,
@@ -268,6 +472,7 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
         backoff_max=backoff_max,
         log_level=log_level,
         log_file=log_file,
+        migration_hint=migration_hint,
     )
 
 
@@ -309,6 +514,9 @@ class NodeConfig:
     allow_public_listen: bool = False
     db_path: str | None = None
     peers: list[str] = field(default_factory=list)
+    directory: dict[str, PeerDirectoryEntry] = field(default_factory=dict)
+    capability: dict[str, Any] | None = None
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     coordinator_node_id: str | None = None
     coordinator_addr: str | None = None
     poll_interval_seconds: int = 5
@@ -316,6 +524,9 @@ class NodeConfig:
     backoff_max: float = 8.0
     log_level: str = "INFO"
     log_file: str | None = None
+    # Set when a legacy `peers` object was migrated in memory. Not serialized:
+    # writing the new shape is what clears it.
+    migration_hint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize back to schema form; ``from_dict`` roundtrips it."""
@@ -329,6 +540,18 @@ class NodeConfig:
             "data_dir": self.data_dir,
             "db_path": self.db_path,
             "peers": list(self.peers),
+            "directory": {
+                node_id: {"role": entry.role, "addrs": list(entry.addrs)}
+                for node_id, entry in self.directory.items()
+            },
+            "capability": dict(self.capability) if self.capability is not None else None,
+            "discovery": {
+                "announce_interval_seconds": self.discovery.announce_interval_seconds,
+                "max_entries": self.discovery.max_entries,
+                "max_announcement_ttl_seconds": self.discovery.max_announcement_ttl_seconds,
+                "offline_after_seconds": self.discovery.offline_after_seconds,
+                "query_timeout_seconds": self.discovery.query_timeout_seconds,
+            },
             "coordinator_node_id": self.coordinator_node_id,
             "coordinator_addr": self.coordinator_addr,
             "poll_interval_seconds": self.poll_interval_seconds,

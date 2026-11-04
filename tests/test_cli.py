@@ -208,27 +208,55 @@ class PeersCommandTests(unittest.TestCase):
     def test_peers_add_is_idempotent_and_list_roundtrips(self) -> None:
         code, out, _ = self._run("peers", "add", self.node_id, "--role", "worker")
         self.assertEqual(code, 0)
-        peers = json.loads(out)["peers"]
-        self.assertEqual(peers[self.node_id]["role"], "worker")
+        payload = json.loads(out)
+        self.assertEqual(payload["peers"], [self.node_id], "D2: peers is now a node-id list")
+        self.assertEqual(payload["directory"][self.node_id]["role"], "worker")
 
         # Duplicate add is idempotent: same single entry, role updated.
         code, out, _ = self._run("peers", "add", self.node_id, "--role", "coordinator")
         self.assertEqual(code, 0)
-        peers = json.loads(out)["peers"]
-        self.assertEqual(set(peers.keys()), {self.node_id})
-        self.assertEqual(peers[self.node_id]["role"], "coordinator")
+        payload = json.loads(out)
+        self.assertEqual(payload["peers"], [self.node_id])
+        self.assertEqual(payload["directory"][self.node_id]["role"], "coordinator")
 
         code, out, _ = self._run("peers", "list")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out)["peers"], peers)
+        self.assertEqual(json.loads(out), payload)
 
     def test_peers_add_appends_addr_without_duplicates(self) -> None:
         addr = "/ip4/127.0.0.1/tcp/12345"
         for _ in range(2):
             code, out, _ = self._run("peers", "add", self.node_id, "--role", "worker", "--addr", addr)
             self.assertEqual(code, 0)
-        peers = json.loads(out)["peers"]
-        self.assertEqual(peers[self.node_id]["addrs"], [addr])
+        directory = json.loads(out)["directory"]
+        self.assertEqual(directory[self.node_id]["addrs"], [addr])
+
+    def test_peers_add_output_is_loadable_by_load_config(self) -> None:
+        """D2 round-trip: what `peers add` writes must load as a NodeConfig."""
+        from idle_compute.config import load_config
+
+        Path(self.config).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.config).write_text(
+            json.dumps(
+                {
+                    "role": "coordinator",
+                    "transport": "tcp",
+                    "data_dir": "var/n1",
+                    "peers": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        for role in ("worker", "coordinator"):
+            code, out, _ = self._run(
+                "peers", "add", self.node_id, "--role", role, "--addr", "/ip4/127.0.0.1/tcp/1"
+            )
+            self.assertEqual(code, 0)
+        config = load_config(self.config)
+        self.assertIn(self.node_id, config.peers)
+        self.assertEqual(config.directory[self.node_id].role, "coordinator")
+        self.assertEqual(config.directory[self.node_id].addrs, ("/ip4/127.0.0.1/tcp/1",))
+        self.assertIsNone(config.migration_hint)
 
     def test_malformed_node_id_is_rejected_with_structured_error(self) -> None:
         code, out, err = self._run("peers", "add", "bogus-id", "--role", "worker")
@@ -240,7 +268,7 @@ class PeersCommandTests(unittest.TestCase):
     def test_peers_list_with_missing_config_is_empty(self) -> None:
         code, out, _ = self._run("peers", "list")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out), {"peers": {}})
+        self.assertEqual(json.loads(out), {"peers": [], "directory": {}})
 
 
 if __name__ == "__main__":
