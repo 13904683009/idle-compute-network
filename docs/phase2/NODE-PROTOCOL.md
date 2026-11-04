@@ -71,11 +71,14 @@
 | CLAIM_REQUEST / CLAIM_GRANT / CLAIM_DENIED | worker→coord | 领取任务；grant 内联 lease + task{type,payload}；denied 结束本轮；已知 claim_request_id 永不新铸租约（§6） |
 | SUBMIT_RESULT / RESULT_ACK | worker→coord | 提交签名结果；ack 内联 `validation ∈ {VALID, INVALID}` 与 credit；同 peer 重放→**原 RESULT_ACK 重放**（幂等积分）；异 peer→不泄露信息的拒绝（`TASK_UNAVAILABLE`） |
 | STATUS_REQUEST / STATUS_RESPONSE | client→coord | 查询任务状态（含 result/validation/credits_count） |
-| LEDGER_SYNC_REQUEST / LEDGER_SYNC_RESPONSE | worker→coord | 账本分页拉取：请求 `{after_seq}`；响应 `{after_seq, head_seq, events, more}`，单页 count≤100 且序列化≤24 KiB（必须装进 32 KiB body 上限）；事件为 13 列导出行的精确键 schema（`sig_algo` 必须 `ed25519`，`event_type` 必须等于 `CreditEventType.CREDIT.value`） |
+| LEDGER_SYNC_REQUEST / LEDGER_SYNC_RESPONSE | worker→coord | 账本分页拉取：请求 `{after_seq}`；响应 `{after_seq, head_seq, events, more}`，单页 count≤100 且序列化≤24 KiB（必须装进 32 KiB body 上限）；事件为 13 列导出行的精确键 schema（`event_type` 必须等于 `CreditEventType.CREDIT.value`；`sig_algo` 只做长度约束，**非 ed25519 行由镜像侧结构化拒绝**，否则整页会被 schema 丢弃、退化成"静默超时"） |
 | ERROR | 任意 | 16 种错误码，`in_reply_to` 指向触发消息的 seq |
 
 续租（RENEW）**未实现**（阶段 F 计划）。
-账本同步（LEDGER_SYNC）已在 E-1 交付：工人每轮主动分页拉取、逐事件验签后写入镜像；失败/分歧置冲突锁存并停止 claim（E-2 继续做隔离与重建恢复）。
+账本同步（LEDGER_SYNC）已在 E-1/E-2 交付：工人每轮主动分页拉取、逐事件验签后写入镜像；
+**每次启动先从 seq 0 重审整条镜像链**（分页续审，可跨轮），已镜像事件的原地篡改会被
+"内容不一致"捕获；任何分歧（含 hmac 行、链比镜像短）置冲突锁存：不跳过、不覆盖、不回卷，
+并在锁存清除前停止 claim。运维面：`idle_compute worker ledger status --config <node.json>`。
 
 ## 6. 状态机集成（网络输入不绕过安全边界）
 

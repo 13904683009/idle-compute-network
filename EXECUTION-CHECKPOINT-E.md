@@ -91,6 +91,51 @@
 
 ## 7. 未完成（按计划顺序）
 
-- E-2：冲突检测/隔离/删除重建恢复、双花重放、hmac 行注入。
 - E-3：`docs/COORDINATION.md` 诚实表 + 架构/协议/威胁模型更新 + grep 级反过度声明测试。
 - F-1..F-4、G-1..G-2、H 独立审计、I 最终交付；双设备验证仍未执行（保持"未验证"）。
+
+---
+
+# 追加：阶段 E-2（同日完成）
+
+提交：`bf35356`（代码+测试）。基线：`daa2835`（259 测试）→ `bf35356`（263 测试）。
+
+## 8. E-2 交付内容
+
+- **镜像元数据**：worker 的 `ledger_copy.db` 增加 `ledger_meta` 表（仅工人侧、非链上）：
+  `ledger.record_conflict / clear_conflict / read_conflict / mirror_status`。
+- **启动全链重审**：工人每次启动从 `seq 0` 重审整条镜像链（`_audit_cursor` 可跨轮续审，
+  受 `MAX_SYNC_PAGES_PER_ROUND` 限制），再转入增量拉取。`verify_and_append` 对"同
+  event_id 但内容不同"的已镜像行返回内容不一致冲突，因此**已镜像事件的原地篡改可检出**，
+  而不是被当作幂等重放静默跳过。
+- **隔离语义**：任何分歧（链篡改、hmac 行、协调者链比镜像短）→ 锁存冲突（含 offending
+  seq，持久化于 `ledger_meta`）→ 停止 claim；不跳过、不覆盖、不回卷。
+  锁存期间协调者侧任务保持 `QUEUED`、无 ACTIVE 租约（测试断言）。
+- **运维面**：新增 `worker ledger status --config <node.json>`，输出
+  `mirror_head / events / verified / conflict{seq,reason,at} / claim_blocked`。
+- **线 schema 调整（重要）**：`LEDGER_SYNC` 事件的 `sig_algo` 不再被钉死为 `ed25519`。
+  原因：整页 schema 拒绝会让恶意降级行退化成"工人侧静默超时"，既无 CONFLICT 也无 seq；
+  现在降级行会到达镜像侧并由 `verify_and_append` 以结构化 CONFLICT 拒绝。安全性不降：
+  镜像依旧只接受 ed25519 行。
+
+## 9. E-2 测试证据
+
+```powershell
+.venv\Scripts\python.exe -m unittest tests.test_ledger_conflict -v
+→ Ran 4 tests in 54.635s → OK
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+→ Ran 263 tests in 226.439s → OK（exit 0）
+.venv\Scripts\python.exe -m compileall -q idle_compute tests
+→ exit 0
+```
+
+- 日志：`C:\Users\linxi\Desktop\DSH工作区\logs\idle-compute\e2-full-suite.log`
+- 覆盖：篡改链 → 新镜像在 seq 3 停住且 claim 被阻断 + CLI 报告 seq 3；hmac 行 → 结构化
+  CONFLICT 且**不截断**已镜像内容；删除 worker.db → 从 0 重建逐列一致；重复同步轮次/重启
+  → 双方各恰 1 事件、幂等键不重复。
+
+## 10. E-2 后的 Git 状态
+
+- 分支 `phase2`，HEAD `bf35356`；无 remote；无 amend/reset/rebase。
+- 回滚点：`daa2835`（E-1 完成，259 绿）、`c5f738a`（阶段 C，249 绿）。
+
