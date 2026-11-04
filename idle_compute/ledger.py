@@ -13,6 +13,7 @@ from typing import Any
 
 from .crypto import GENESIS_HASH, content_hash, credit_body
 from .models import CreditEvent, CreditEventType, new_id, utc_now
+from .protocol import LEDGER_PAGE_BYTES, MAX_SYNC_PAGE_EVENTS
 from .signing import Ed25519Policy, HmacLegacyPolicy, SigningPolicy
 
 
@@ -238,7 +239,7 @@ def rebuild_ledger(conn: sqlite3.Connection, signer: SigningPolicy) -> dict[str,
     return {"valid": True, "events": len(iter_events(conn)), "balances": balances, "task_credits": task_credits}
 
 
-MAX_SYNC_BATCH = 100
+MAX_SYNC_BATCH = MAX_SYNC_PAGE_EVENTS  # count clamp per sync page (100)
 
 
 def export_since(conn: sqlite3.Connection, after_seq: int, limit: int = MAX_SYNC_BATCH) -> list[dict[str, Any]]:
@@ -253,6 +254,47 @@ def export_since(conn: sqlite3.Connection, after_seq: int, limit: int = MAX_SYNC
         (after_seq, limit),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def head_seq(conn: sqlite3.Connection) -> int:
+    """The chain's current head (0 when empty)."""
+    row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS h FROM credit_events").fetchone()
+    return int(row["h"])
+
+
+def export_page(
+    conn: sqlite3.Connection,
+    after_seq: int,
+    limit: int = MAX_SYNC_BATCH,
+    max_bytes: int = LEDGER_PAGE_BYTES,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Export one LEDGER_SYNC page: events with seq > after_seq, clamped by
+    COUNT (MAX_SYNC_BATCH) and by serialized SIZE (max_bytes) so a response
+    always fits the wire body cap. Returns (events, more) where ``more`` is
+    True when rows beyond this page exist (the puller must request the next
+    page with after_seq = last returned seq)."""
+    limit = max(0, min(int(limit), MAX_SYNC_BATCH))
+    rows = conn.execute(
+        "SELECT * FROM credit_events WHERE seq > ? ORDER BY seq LIMIT ?",
+        (after_seq, limit),
+    ).fetchall()
+    events: list[dict[str, Any]] = []
+    size = 0
+    for row in rows:
+        event = dict(row)
+        item = len(json.dumps(event, ensure_ascii=False, sort_keys=True))
+        if events and size + item > max_bytes:
+            break
+        events.append(event)
+        size += item
+    if not events:
+        return [], False
+    last_seq = events[-1]["seq"]
+    more = (
+        conn.execute("SELECT 1 FROM credit_events WHERE seq > ? LIMIT 1", (last_seq,)).fetchone()
+        is not None
+    )
+    return events, more
 
 
 LEDGER_COPY_SCHEMA = """

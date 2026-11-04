@@ -33,7 +33,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from .crypto import canonical_json, node_msg_payload
-from .models import utc_now
+from .models import CreditEventType, utc_now
 
 PROTOCOL_VERSION = 1
 PROTOCOL_NAME = "/idle-compute/1.0.0"
@@ -51,6 +51,15 @@ MAX_LISTEN_ADDRS = 8
 MAX_ADDR_CHARS = 200
 MAX_STRING = 512
 MAX_REF_ID = 128
+# LEDGER_SYNC page budget: the coordinator clamps each page so the serialized
+# events stay under this many bytes -- comfortably inside MAX_BODY_BYTES after
+# envelope overhead, whatever the caller asks for. MAX_SYNC_PAGE_EVENTS is the
+# count clamp (100 events max per page even if they would fit the byte budget).
+LEDGER_PAGE_BYTES = 24 * 1024
+MAX_SYNC_PAGE_EVENTS = 100
+# Per-event bound inside a LEDGER_SYNC_RESPONSE page (metadata is the only
+# unbounded string in a credit row).
+MAX_EVENT_METADATA = 2048
 
 _B58_ALPHABET = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 _NODE_ID_PREFIX = "12D3KooW"
@@ -89,7 +98,7 @@ class ProtocolError(Exception):
 
 
 class MessageType(str, Enum):
-    """Closed registry of wire message types (14)."""
+    """Closed registry of wire message types (16)."""
 
     HELLO = "HELLO"
     HELLO_ACK = "HELLO_ACK"
@@ -105,6 +114,8 @@ class MessageType(str, Enum):
     RESULT_ACK = "RESULT_ACK"
     STATUS_REQUEST = "STATUS_REQUEST"
     STATUS_RESPONSE = "STATUS_RESPONSE"
+    LEDGER_SYNC_REQUEST = "LEDGER_SYNC_REQUEST"
+    LEDGER_SYNC_RESPONSE = "LEDGER_SYNC_RESPONSE"
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +590,58 @@ def _check_status_response(value: Any) -> None:
         raise ProtocolError(ErrorCode.INVALID_BODY, "STATUS_RESPONSE body shape invalid")
 
 
+def _check_ledger_sync_request(value: Any) -> None:
+    if not (isinstance(value, dict) and isinstance(value.get("after_seq"), int) and value["after_seq"] >= 0):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEDGER_SYNC_REQUEST body must be {after_seq: int>=0}")
+
+
+def _check_sync_event(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEDGER_SYNC_RESPONSE events must be objects")
+    if set(value) != {
+        "seq", "event_id", "event_type", "peer_id", "task_id", "amount",
+        "idempotency_key", "created_at", "prev_hash", "event_hash",
+        "signature", "sig_algo", "metadata_json",
+    }:
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEDGER_SYNC_RESPONSE event keys must be the 13 exported row fields")
+    if not (
+        isinstance(value.get("seq"), int) and value["seq"] >= 1
+        and _is_short_str(value.get("event_id"))
+        # The stored column carries the canonical enum value ("CREDIT"), and
+        # that exact string is part of the signed credit body, so the wire
+        # schema must not normalize/lowercase it.
+        and value.get("event_type") == CreditEventType.CREDIT.value
+        and _looks_like_node_id(value.get("peer_id"))
+        and _is_short_str(value.get("task_id"))
+        and isinstance(value.get("amount"), int)
+        and _is_short_str(value.get("idempotency_key"), 256)
+        and _is_short_str(value.get("created_at"), 64)
+        and _is_hex(value.get("prev_hash"), HASH_HEX_LENGTH)
+        and _is_hex(value.get("event_hash"), HASH_HEX_LENGTH)
+        and _is_hex(value.get("signature"), SIG_HEX_LENGTH)
+        and value.get("sig_algo") == "ed25519"
+        and isinstance(value.get("metadata_json"), str)
+        and len(value["metadata_json"]) <= MAX_EVENT_METADATA
+    ):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEDGER_SYNC_RESPONSE event shape invalid")
+
+
+def _check_ledger_sync_response(value: Any) -> None:
+    if not (
+        isinstance(value, dict)
+        and isinstance(value.get("after_seq"), int)
+        and value["after_seq"] >= 0
+        and isinstance(value.get("head_seq"), int)
+        and value["head_seq"] >= 0
+        and isinstance(value.get("events"), list)
+        and len(value["events"]) <= MAX_SYNC_PAGE_EVENTS
+        and isinstance(value.get("more"), bool)
+    ):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEDGER_SYNC_RESPONSE body shape invalid")
+    for event in value["events"]:
+        _check_sync_event(event)
+
+
 BODY_SCHEMAS: dict[MessageType, Callable[[Any], None]] = {
     MessageType.HELLO: _check_hello,
     MessageType.HELLO_ACK: _check_hello_ack,
@@ -594,6 +657,8 @@ BODY_SCHEMAS: dict[MessageType, Callable[[Any], None]] = {
     MessageType.RESULT_ACK: _check_result_ack,
     MessageType.STATUS_REQUEST: _check_status_request,
     MessageType.STATUS_RESPONSE: _check_status_response,
+    MessageType.LEDGER_SYNC_REQUEST: _check_ledger_sync_request,
+    MessageType.LEDGER_SYNC_RESPONSE: _check_ledger_sync_response,
 }
 
 
@@ -623,6 +688,8 @@ _BODY_KEYS: dict[MessageType, tuple[str, ...]] = {
     MessageType.RESULT_ACK: ("result_id", "lease_id", "task_id", "validation", "reason", "credit"),
     MessageType.STATUS_REQUEST: ("task_id",),
     MessageType.STATUS_RESPONSE: ("task_id", "status", "result", "validation", "credits_count"),
+    MessageType.LEDGER_SYNC_REQUEST: ("after_seq",),
+    MessageType.LEDGER_SYNC_RESPONSE: ("after_seq", "head_seq", "events", "more"),
 }
 
 

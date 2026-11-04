@@ -85,11 +85,19 @@ logger = logging.getLogger("idle_compute.node")
 HELLO_ACK_TIMEOUT = 15.0
 REQUEST_TIMEOUT = 20.0
 SUBMIT_ACK_TIMEOUT = 30.0
+LEDGER_SYNC_TIMEOUT = 20.0
+MAX_SYNC_PAGES_PER_ROUND = 20  # bounded catch-up per worker cycle
 WORK_QUEUE_SIZE = 1024
 REPLY_BUFFER_SIZE = 64
 
 _COORD_HANDLED = frozenset(
-    {MessageType.TASK_CREATE, MessageType.CLAIM_REQUEST, MessageType.SUBMIT_RESULT, MessageType.STATUS_REQUEST}
+    {
+        MessageType.TASK_CREATE,
+        MessageType.CLAIM_REQUEST,
+        MessageType.SUBMIT_RESULT,
+        MessageType.STATUS_REQUEST,
+        MessageType.LEDGER_SYNC_REQUEST,
+    }
 )
 _WORKER_REPLY_TYPES = frozenset(
     {
@@ -99,6 +107,7 @@ _WORKER_REPLY_TYPES = frozenset(
         MessageType.CLAIM_GRANT,
         MessageType.CLAIM_DENIED,
         MessageType.RESULT_ACK,
+        MessageType.LEDGER_SYNC_RESPONSE,
     }
 )
 _CLIENT_REPLY_TYPES = frozenset(
@@ -235,6 +244,14 @@ class Node:
         self._started = False
         self._connected = False
         self._shutdown_done = False
+        # File log handler attached by run() and detached in shutdown(); a
+        # logging.FileHandler left attached keeps the log file open (and
+        # locked on Windows) after the node stops.
+        self._log_handler: logging.Handler | None = None
+        # E-2 ledger-divergence latch: set when the mirror cannot follow the
+        # coordinator chain; the worker stops claiming until a sync round
+        # passes cleanly (which only happens once the divergence is fixed).
+        self._ledger_conflict: str | None = None
 
     # ------------------------------------------------------------------ seq
 
@@ -514,9 +531,34 @@ class Node:
                 self._handle_submit_result(env, write)
             elif env.type is MessageType.STATUS_REQUEST:
                 self._handle_status_request(env, write)
+            elif env.type is MessageType.LEDGER_SYNC_REQUEST:
+                self._handle_ledger_sync_request(env, write)
         except Exception:
             logger.exception("coordinator handler failed for %s", env.type.value)
             self._reply_error(write, ErrorCode.INTERNAL, "internal error", env)
+
+    def _handle_ledger_sync_request(self, env: Any, write: Callable[[bytes], None]) -> None:
+        """Serve one LEDGER_SYNC page (read-only, no state change).
+
+        Pages are clamped by count AND serialized size (ledger.export_page),
+        so a response always fits the wire body cap; ``more`` tells the
+        puller whether to request the next page. Runs on the coordinator
+        loop thread, so the Store connection is this thread's own.
+        """
+        conn = self._store.conn
+        after_seq = int(env.body["after_seq"])
+        events, more = ledger.export_page(conn, after_seq)
+        self._reply(
+            write,
+            MessageType.LEDGER_SYNC_RESPONSE,
+            {
+                "after_seq": after_seq,
+                "head_seq": ledger.head_seq(conn),
+                "events": events,
+                "more": more,
+            },
+            env,
+        )
 
     def _handle_task_create(self, env: Any, write: Callable[[bytes], None]) -> None:
         client_ref = env.body["client_ref"]
@@ -747,18 +789,39 @@ class Node:
     # ------------------------------------------------------------ run loop
 
     def _configure_logging(self) -> None:
-        handlers: list[logging.Handler] = [logging.StreamHandler()]
-        if self.config.log_file:
-            try:
-                handlers.append(logging.FileHandler(self.config.log_file, encoding="utf-8"))
-            except OSError:
-                logger.warning("cannot open log file %s", self.config.log_file)
+        level = getattr(logging, self.config.log_level, logging.INFO)
         logging.basicConfig(
-            level=getattr(logging, self.config.log_level, logging.INFO),
+            level=level,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
-            handlers=handlers,
+            handlers=[logging.StreamHandler()],
             force=False,
         )
+        logging.getLogger("idle_compute").setLevel(level)
+        if not self.config.log_file:
+            return
+        # The file handler belongs to THIS node and is detached again in
+        # shutdown(): attaching it permanently (e.g. via basicConfig) would
+        # keep the file open for the process lifetime and, on Windows, locked
+        # against deletion long after the node stopped.
+        self._detach_log_handler()
+        try:
+            handler: logging.Handler = logging.FileHandler(self.config.log_file, encoding="utf-8")
+        except OSError:
+            logger.warning("cannot open log file %s", self.config.log_file)
+            return
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logging.getLogger("idle_compute").addHandler(handler)
+        self._log_handler = handler
+
+    def _detach_log_handler(self) -> None:
+        handler, self._log_handler = self._log_handler, None
+        if handler is None:
+            return
+        try:
+            logging.getLogger("idle_compute").removeHandler(handler)
+        finally:
+            handler.close()
 
     def _ensure_transport_started(self) -> None:
         if not self._started:
@@ -806,16 +869,28 @@ class Node:
         # Opened on THIS thread: the Store connection is single-threaded
         # (actor model) and sqlite3 requires the creating thread.
         self._store = Store(self._db_path, signer=self._policy)
-        while not self._stopping.is_set():
-            try:
-                self._store.expire_leases()
-            except Exception:
-                logger.exception("lease expiry failed")
-            try:
-                env, write = self._work.get(timeout=self.config.poll_interval_seconds)
-            except queue.Empty:
-                continue
-            self._handle_coordinator(env, write)
+        try:
+            while not self._stopping.is_set():
+                try:
+                    self._store.expire_leases()
+                except Exception:
+                    logger.exception("lease expiry failed")
+                try:
+                    env, write = self._work.get(timeout=self.config.poll_interval_seconds)
+                except queue.Empty:
+                    continue
+                self._handle_coordinator(env, write)
+        finally:
+            # Close on THIS thread. sqlite3 connections are thread-affine, so
+            # closing from Node.shutdown()'s thread raises ProgrammingError;
+            # swallowing that left the DB file locked after a clean shutdown
+            # (found by the E-1 worker-mirror test teardown).
+            store, self._store = self._store, None
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    logger.exception("closing the coordinator store failed")
 
     def _worker_loop(self) -> None:
         # Opened on THIS thread (see _coordinator_loop). The ledger's
@@ -830,24 +905,98 @@ class Node:
         if not coordinator or not self.config.coordinator_addr:
             raise NodeError("worker requires coordinator_node_id and coordinator_addr")
         backoff = self.config.backoff_min
-        while not self._stopping.is_set():
-            try:
-                self._ensure_connected()
-                self._send_to(coordinator, MessageType.PING, {"nonce": new_id("png_")})
+        try:
+            while not self._stopping.is_set():
                 try:
-                    self._claim_cycle(coordinator)
-                except NodeTimeoutError:
-                    pass  # nothing claimable this round
-                self._stopping.wait(self.config.poll_interval_seconds)
-                # Reset only after a FULL healthy cycle: dial-then-fail
-                # loops must keep doubling, not reconnect at backoff_min
-                # forever (audit finding node.py:744).
-                backoff = self.config.backoff_min
-            except (TransportError, NodeError) as exc:
-                logger.warning("worker link failed: %s", exc)
-                self._connected = False
-                self._stopping.wait(backoff)
-                backoff = min(backoff * 2, self.config.backoff_max)
+                    self._ensure_connected()
+                    self._send_to(coordinator, MessageType.PING, {"nonce": new_id("png_")})
+                    self._sync_ledger(coordinator)
+                    if not self._ledger_conflict:
+                        try:
+                            self._claim_cycle(coordinator)
+                        except NodeTimeoutError:
+                            pass  # nothing claimable this round
+                    self._stopping.wait(self.config.poll_interval_seconds)
+                    # Reset only after a FULL healthy cycle: dial-then-fail
+                    # loops must keep doubling, not reconnect at backoff_min
+                    # forever (audit finding node.py:744).
+                    backoff = self.config.backoff_min
+                except (TransportError, NodeError) as exc:
+                    logger.warning("worker link failed: %s", exc)
+                    self._connected = False
+                    self._stopping.wait(backoff)
+                    backoff = min(backoff * 2, self.config.backoff_max)
+        finally:
+            # Same thread-affinity rule as the coordinator store above: the
+            # mirror connection must be closed by the thread that opened it.
+            mirror, self._mirror = self._mirror, None
+            if mirror is not None:
+                try:
+                    mirror.close()
+                except Exception:
+                    logger.exception("closing the mirror connection failed")
+
+    def _mirror_head_seq(self) -> int:
+        row = self._mirror.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS h FROM ledger_copy"
+        ).fetchone()
+        return int(row[0])
+
+    def _sync_ledger(self, coordinator: str) -> None:
+        """Pull LEDGER_SYNC pages until the mirror reaches the chain head.
+
+        Every event is fully verified before it is appended
+        (ledger.verify_and_append: shape -> scheme -> duplicate -> seq
+        continuity -> prev_hash linkage -> hash -> signature -> amount).
+        Any failure latches ``self._ledger_conflict`` and stops this round
+        (E-2 policy): the worker never skips a bad event, never overwrites
+        a mirror row, and stops claiming while the chains diverge.
+        """
+        after = self._mirror_head_seq()
+        for _ in range(MAX_SYNC_PAGES_PER_ROUND):
+            seq = self._send_to(
+                coordinator,
+                MessageType.LEDGER_SYNC_REQUEST,
+                {"after_seq": after},
+            )
+            try:
+                env = self._await(
+                    lambda e: e.type is MessageType.LEDGER_SYNC_RESPONSE,
+                    LEDGER_SYNC_TIMEOUT,
+                    seq,
+                )
+            except NodeTimeoutError:
+                logger.warning("ledger sync timed out; retrying next round")
+                return
+            except NodeRemoteError as exc:
+                logger.warning("ledger sync refused: %s", exc)
+                return
+            body = env.body
+            head = int(body["head_seq"])
+            for event in body["events"]:
+                ok, reason = ledger.verify_and_append(self._mirror, event, self._policy)
+                if not ok:
+                    self._ledger_conflict = reason
+                    logger.error(
+                        "ledger conflict: %s (worker stops claiming until it clears)", reason
+                    )
+                    return
+            if body["events"]:
+                after = int(body["events"][-1]["seq"])
+            if head < after:
+                # The coordinator chain is SHORTER than the mirror: the
+                # coordinator lost its ledger (or was replaced). Never
+                # silently truncate the mirror -- stop and wait for the
+                # operator to rebuild (E-2 policy).
+                self._ledger_conflict = f"coordinator head {head} < mirror head {after}"
+                logger.error("ledger conflict: %s", self._ledger_conflict)
+                return
+            if not body["more"]:
+                break
+        # A clean round (no conflict latched) clears any earlier latch, so a
+        # divergence fixed upstream lets the worker resume claiming on its
+        # next cycle.
+        self._ledger_conflict = None
 
     def _ensure_connected(self) -> None:
         if self._connected:
@@ -1067,17 +1216,21 @@ class Node:
             self.transport.stop()
         except Exception as exc:
             logger.debug("transport stop failed: %s", exc)
-        # Drain the role loop BEFORE closing its connections: sqlite3 conns
-        # belong to the loop thread, and closing them under a live
-        # transaction races the thread that uses them (audit finding
-        # node.py:941). The loop wakes on _stopping within one poll
-        # interval.
+        # Drain the role loop BEFORE closing anything else. The role loops
+        # close their own sqlite connections in a ``finally`` block: those
+        # connections are thread-affine, so closing them from here raises
+        # ProgrammingError and, if swallowed, would leave the DB file locked
+        # after a clean shutdown.
         loop_thread = getattr(self, "_loop_thread", None)
         if loop_thread is not None and loop_thread is not threading.current_thread():
             loop_thread.join(timeout=self.config.poll_interval_seconds + 1.0)
-        for closer in (self._store, self._mirror, self._aux):
-            try:
-                if closer is not None:
-                    closer.close()
-            except Exception:
-                pass
+        # ``_aux`` is the one connection opened on the constructing thread
+        # (check_same_thread=False + a lock), so it is safe to close here.
+        try:
+            if self._aux is not None:
+                self._aux.close()
+        except Exception as exc:
+            logger.debug("closing the aux connection failed: %s", exc)
+        # Detach the per-node file handler last: after this the log file is
+        # closed and (on Windows) no longer locked against deletion.
+        self._detach_log_handler()

@@ -1196,6 +1196,32 @@ class ShutdownTests(NodeTestsBase):
         self.assertFalse(thread.is_alive(), "node must exit its run loop")
         self.assertEqual(result, [0])
 
+    def test_shutdown_closes_the_store_on_the_loop_thread(self) -> None:
+        """A clean shutdown must release coordinator.db (no leaked sqlite handle).
+
+        Regression: shutdown() used to close the Store from the caller's
+        thread; sqlite3 refuses cross-thread use, the ProgrammingError was
+        swallowed, and the DB file stayed locked after shutdown (caught by the
+        E-1 worker-mirror test teardown). Renaming a locked file fails on
+        Windows, so rename is the observable assertion.
+        """
+        coord_tmp = self.tmp("coord-db")
+        _identity(coord_tmp, "coord")
+        node = Node(_coord_config(coord_tmp, [], listen_port=0))
+        thread = threading.Thread(target=node.run, name="shutdown-db-node", daemon=True)
+        thread.start()
+        _wait_for(lambda: bool(node.transport.advertised_addrs()), 15.0, "node start")
+        node.shutdown()
+        thread.join(10.0)
+        self.assertFalse(thread.is_alive(), "node must exit its run loop")
+
+        db = coord_tmp / "coordinator.db"
+        self.assertTrue(db.exists(), "the coordinator DB must have been created")
+        probe = db.with_suffix(".db.released")
+        db.rename(probe)  # PermissionError here means the file is still locked
+        self.assertTrue(probe.exists())
+        probe.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

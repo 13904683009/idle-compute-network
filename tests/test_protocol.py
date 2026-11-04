@@ -147,6 +147,31 @@ def valid_body(type_: MessageType) -> dict:
             "validation": None,
             "credits_count": 0,
         },
+        MessageType.LEDGER_SYNC_REQUEST: {"after_seq": 0},
+        MessageType.LEDGER_SYNC_RESPONSE: {
+            "after_seq": 0,
+            "head_seq": 1,
+            "events": [
+                {
+                    "seq": 1,
+                    "event_id": "evt_1",
+                    # The stored/signed column value is the canonical enum
+                    # value ("CREDIT"), not a lowercased label.
+                    "event_type": "CREDIT",
+                    "peer_id": SENDER,
+                    "task_id": "t1",
+                    "amount": 1,
+                    "idempotency_key": "credit:t1:" + SENDER,
+                    "created_at": FIXED_TS,
+                    "prev_hash": "0" * 64,
+                    "event_hash": "a" * 64,
+                    "signature": "b" * 128,
+                    "sig_algo": "ed25519",
+                    "metadata_json": "{}",
+                }
+            ],
+            "more": False,
+        },
     }
     return samples[type_]
 
@@ -397,9 +422,9 @@ class TestTimestamp(unittest.TestCase):
 
 
 class TestBodyRegistry(unittest.TestCase):
-    def test_all_14_types_have_schemas_and_accept_valid_bodies(self):
-        self.assertEqual(len(BODY_SCHEMAS), 14)
-        self.assertEqual(len(MessageType), 14)
+    def test_all_16_types_have_schemas_and_accept_valid_bodies(self):
+        self.assertEqual(len(BODY_SCHEMAS), 16)
+        self.assertEqual(len(MessageType), 16)
         for type_ in MessageType:
             validate_body(type_, valid_body(type_))  # must not raise
 
