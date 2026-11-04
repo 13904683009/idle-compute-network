@@ -165,3 +165,61 @@ F-1 完成后，以下"未实现"陈述已同步改写，否则 `tests/test_docs
 - HEAD `1ff7d4f`；无 remote；无 amend/reset/rebase。
 - 回滚点：`4fda429`（F-2 完成，282 绿）、`5af245e`（F-1，278 绿）。
 - 剩余：F-4（日志脱敏）→ G-1/G-2 → H → I；双设备验证仍未执行。
+
+---
+
+# 追加：F-4（日志脱敏）— 阶段 F 完成
+
+提交：`48dce02`。基线：`e3ca659`（288 测试）→ `48dce02`（**293 测试**）。
+
+## 12. F-4 交付内容
+
+- **`idle_compute/log.py`（新增）**：
+  - `short_id`（12 字符 + `…`）、`short_hex`（8 字符 + `…`）、
+    `payload_summary`（只记 keys / 字段数 / numbers 计数，**不记值**）；
+  - `redact_text`：正则替换 52 字符 node id、128 hex 签名、64 hex 哈希、
+    Windows/POSIX `*.key` 路径（→ `<key-file>`）；
+  - `RedactionFilter` + `install_redaction`：**挂在 handler 上**。
+    这一点是实测结论：Python logging 只在**产生记录的 logger** 上执行 logger 级 filter，
+    向父 logger 传播时不会重跑父级的 logger filter，所以只在 `idle_compute` 上挂 filter
+    会漏掉 `idle_compute.node` 的记录。
+- **`node.py`**：`_configure_logging` 给 console handler 与文件 handler 都装上该过滤器。
+- **`tests/test_log.py`（新增 5 项）**：
+  1) 截断规则；2) 载荷摘要不含值；3) `redact_text` 四类替换；
+  4) 过滤器（含 `%s` 参数化消息）；5) **真实三进程 DEBUG 捕获**：
+     协调者 + 工人子进程 + client CLI 进程，跑完一个真实任务（含大整数载荷），
+     再从未列名单身份发 HELLO（断言回 `UNAUTHORIZED`），然后读取产出：
+     无身份密钥字节、无 `*.key` 路径、无 128 hex 签名、无载荷数值。
+
+## 13. F-4 测试证据
+
+```powershell
+.venv\Scripts\python.exe -m unittest tests.test_log -v
+→ Ran 5 tests in 4.314s → OK
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+→ Ran 293 tests in 332.249s → OK（exit 0）
+.venv\Scripts\python.exe -m compileall -q idle_compute tests
+→ exit 0
+```
+
+日志：`C:\Users\linxi\Desktop\DSH工作区\logs\idle-compute\f4-full-suite-2.log`
+
+> 过程中被源码安全扫描抓到一次真实回归：`log.py` 使用 `re.compile(...)`，
+> 触发 `test_source_safety` 的 `compile(` 禁词（该扫描不知道 `re.compile` 不是代码执行）。
+> 处理方式是**改实现而不是改门禁**：log.py 改用 `re.sub(模式字符串, ...)`，
+> 门禁原样保留（严格）。
+
+## 14. 阶段 F 完成度
+
+| 项 | 结果 |
+| --- | --- |
+| F-1 限流 | done（`0644870`），8 测试 |
+| F-2 错误隔离/资源上限 | done（`0f4fc5e`），4 测试 |
+| F-3 线边界/注册表/源码门禁 | done（`1ff7d4f`），3 + 5 测试 |
+| F-4 日志脱敏 | done（`48dce02`），5 测试 |
+| 测试基线 | 270（阶段 E）→ 278 → 282 → 288 → **293**，全部真实执行、0 跳过 |
+| HEAD | `48dce02`；回滚点 `e3ca659`（288 绿）、`4fda429`（282 绿） |
+
+**阶段 G 尚未开始**：G-1（10 场景真实子进程集成套件，连跑两遍）、G-2（`run_three_nodes.py`
+可复现脚本 + 证据采集 + 全量门禁 + 文档冻结），随后 H 独立审计、I 最终交付。
+双设备验证仍未执行（保持"未验证"）。

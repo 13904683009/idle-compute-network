@@ -73,7 +73,7 @@
 | F-1 | ratelimit.py + 持久化 seq 窗口 + ts 容差对抗测试 | 主循环 | done | 令牌桶数学（20 msg/s、突发 40）用注入时钟确定性验证；真实洪泛 → 2 次触发/60 s → 关流 + node_id 隔离 30 s（TCP 重连在 HELLO 阶段即被拒），其他 peer 不受影响；重启后重放旧帧被**持久化**窗口拒绝（`SEQ_OUT_OF_WINDOW`）；窗口缺口/越界、±300 s STALE、BAD_SENDER 先于验签、旧 ACK 重放不双发由既有测试覆盖并在此引用 | tests/test_ratelimit.py 8/8（6 确定性单元 + 2 真实 socket：洪泛隔离、重启重放拒绝）；既有覆盖：test_protocol.py（窗口/时间戳/顺序）、test_node.py（BAD_SENDER、重复提交单积分）；全量 **278/278**，compileall exit 0；提交 `0644870` |
 | F-2 | 错误隔离 + 洪泛/超大帧/资源上限测试（运行中的节点） | 主循环 | done | 50 消息/秒洪泛触发令牌桶（由 F-1 真实洪泛测试覆盖）；超大帧在分配前拒绝（既有 test_node 覆盖）；**第 1001 个非终态任务 → OVERLOAD**（新实现的任务池上限）；单流异常不影响其他已绑定流；200 畸形帧后节点仍服务；真实**节点进程**在虐待后仍存活并能服务真实 client | tests/test_abuse.py 4/4（任务池上限、双流隔离、200 帧模糊、真实子进程虐待存活）；既有覆盖：test_node.py 超大帧/垃圾帧/非法 body；全量 **282/282**，compileall exit 0；提交 `0f4fc5e` |
 | F-3 | 线边界输入校验 + 仅注册表分发 + 扩展源码安全扫描 | 主循环 | done | 垃圾帧/未知类型/非白名单任务类型/5000 数载荷/bool 载荷/深嵌套/多余键/shell 元字符均拒绝且**不到达执行器**（instrumentation 证明 + 正控）；全源码扫描无 eval/exec/subprocess/importlib 等；libp2p 仅两处；无 asyncio；`TASK_TYPES` 唯一分发点、Phase-2 运行时只经 `get_task_type` | tests/test_wire_boundary.py 3/3（10 类恶意载荷 + 未知类型 + 深度 20 炸弹）；tests/test_source_safety.py 5/5（+3 新门禁）；全量 **288/288**，compileall exit 0；提交 `1ff7d4f` |
-| F-4 | log.py 脱敏 + 白名单策略测试 | 待定 | todo | 每条脱敏规则测试（node id 12 字符/签名 8 字符/载荷只记计数）；3 进程对抗运行捕获日志无密钥字节/无密钥路径/无完整签名；未列名单 HELLO→UNAUTHORIZED 关流 | — |
+| F-4 | log.py 脱敏 + 白名单策略测试 | 主循环 | done | 每条脱敏规则测试（node id 12 字符/签名与哈希 8 字符/载荷只记计数/key 路径→`<key-file>`）；3 进程 DEBUG 对抗运行捕获日志**无密钥字节/无密钥路径/无完整签名/无载荷值**；未列名单 HELLO→`UNAUTHORIZED` 关流（测试中直接断言 ERROR 回包）；过滤器挂在 handler 级（传播时 logger 级 filter 不生效） | tests/test_log.py 5/5（4 条规则单元 + 过滤器 + 真实三进程 DEBUG 捕获）；全量 **293/293**，compileall exit 0；提交 `48dce02` |
 
 ## 阶段 G（集成验收）
 
