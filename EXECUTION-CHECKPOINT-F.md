@@ -75,7 +75,50 @@ F-1 完成后，以下"未实现"陈述已同步改写，否则 `tests/test_docs
 
 ## 5. 未完成
 
-- **F-2**：错误隔离 + 洪泛/超大帧/资源上限（运行中节点）、200 畸形帧模糊测试、1001 任务 OVERLOAD、进程虐待后存活。
 - **F-3**：线边界全套输入校验 + 注册表分发唯一性 + 扩展源码安全扫描。
 - **F-4**：日志脱敏（node id 截断/签名与哈希截断/只记计数）+ 3 进程对抗日志捕获。
 - G-1/G-2、H 独立审计、I 最终交付；双设备验证仍未执行（保持"未验证"）。
+
+---
+
+# 追加：F-2（错误隔离与资源上限）
+
+提交：`0f4fc5e`。基线：`5af245e`（278 测试）→ `0f4fc5e`（**282 测试**）。
+
+## 6. F-2 交付内容
+
+- **任务池上限（新实现）**：协调者对**非终态任务**（QUEUED/LEASED/RUNNING/SUBMITTED）
+  设 `MAX_ACTIVE_TASKS = 1000`；第 1001 个 `TASK_CREATE` 回
+  `ERROR(OVERLOAD, "task pool is full")`。计数在 actor 线程内完成 → 无 check-then-insert
+  竞态；终态任务不计入。
+  > 说明：此前 PROTOCOL/THREAT_MODEL 已把"任务队列上限 1000"写成现网值，但代码里
+  > **并不存在**该检查。F-2 才发现并补上——这是"文档先于实现"的一次实例，已按实现修正。
+- **错误隔离（验证 + 测试固化）**：单条流在框架层损坏只关该流；另一条已绑定流继续
+  正常 PING/PONG；200 个畸形帧后节点仍服务；真实子进程（`node run`）在 200 帧虐待后
+  仍存活并成功响应真实 client 的 PING。
+
+## 7. F-2 测试证据
+
+```powershell
+.venv\Scripts\python.exe -m unittest tests.test_abuse -v
+→ Ran 4 tests in 34.685s → OK
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+→ Ran 282 tests in 293.199s → OK（exit 0）
+.venv\Scripts\python.exe -m compileall -q idle_compute tests
+→ exit 0
+```
+
+日志：`C:\Users\linxi\Desktop\DSH工作区\logs\idle-compute\f2-full-suite.log`
+
+| 测试 | 断言 |
+| --- | --- |
+| `test_task_pool_cap_returns_overload_on_the_1001st` | 预置 1000 个任务 → 线上 TASK_CREATE 收到 code 15 + "full" |
+| `test_stream_failure_does_not_affect_another_bound_stream` | 一条流被截断帧打死，另一条**已绑定**流仍收到 PONG |
+| `test_200_malformed_frames_leave_the_node_serving` | 200 个合法帧头+非法 JSON 后，新 peer 仍能握手并 PING |
+| `test_node_process_survives_abuse` | 真实子进程被 200 帧虐待后 `poll() is None`，且真实 client 仍收到 PONG |
+
+## 8. F-2 后的 Git 状态
+
+- HEAD `0f4fc5e`；无 remote；无 amend/reset/rebase。
+- 回滚点：`5af245e`（F-1 完成，278 绿）、`f52a502`（阶段 E，270 绿）。
+- 剩余：F-3（线边界 + 源码扫描）、F-4（日志脱敏），随后 G-1/G-2、H、I。
