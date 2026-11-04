@@ -58,7 +58,7 @@
 | --- | --- | --- | --- | --- | --- |
 | E-1 | LEDGER_SYNC 分页拉取 + 工人链验证至字节一致镜像 | 主循环 | done | 同步后 ledger_copy 与协调者链逐列一致（13 列逐字段比对 + 规范序列化逐字节一致）；分页 count≤100 且单页序列化≤24 KiB，无缺无重、尾页 `more=False`；after_seq 超头→空页+当前头；每事件验签+prev_hash+amount>0 后才追加；坏事件不追加且错误信息带 event_id/seq | tests/test_ledger_sync.py 9/9（真实子进程 150 事件镜像逐列一致、断点续传、坏事件截断、线 schema 一致 + `event_type` 漂移守卫）；tests/test_node.py ShutdownTests 新增 DB 句柄释放回归；全量 **259/259**，compileall exit 0；提交 `d2046bf` |
 | E-2 | 工人冲突检测 + 隔离 + 删除重建恢复 | 主循环 | done | 篡改链→工人锁存 CONFLICT、在坏事件处停住（不跳过/不覆盖/不回卷）并停止 claim；每次启动从 seq 0 重审整条镜像链（分页续审、可跨轮），已镜像事件的原地篡改可检出；`worker ledger status` 输出镜像头/已验数/冲突 seq+原因/claim_blocked；删 worker.db→从 0 重建逐列一致；重复轮次与重启不重复计分；hmac 行→结构化 CONFLICT（线 schema 不整页拒绝，避免退化成静默超时） | tests/test_ledger_conflict.py 4/4（真实子进程 + CLI 断言）；全量 **263/263**，compileall exit 0；提交 `bf35356` |
-| E-3 | docs/COORDINATION.md 诚实表 + 架构/协议/威胁模型更新 | 待定 | todo | 三类表逐字落档（协调者权威/工人可验/明确非去中心化）；"防篡改 ≠ 共识"表述；THREAT_MODEL 新增行；grep 级测试禁止文档声称共识/DHT/mDNS/UPnP | — |
+| E-3 | docs/COORDINATION.md 诚实表 + 架构/协议/威胁模型更新 | 主循环 | done | 三类表逐字落档（协调者权威/工人可验证/明确非去中心化）；"单写者 + 协调者签名的哈希链 = 防篡改证据，不是共识"表述；THREAT_MODEL 第二阶段新增 13 行威胁（含"未实现/未验证"标注）；grep 级测试（tests/test_docs.py，7 项）禁止任何文档声称共识/DHT/mDNS/UPnP/多设备已验证/生产可用 | 新增 `docs/COORDINATION.md`；重写 `docs/PROTOCOL.md`（v2 线协议全量：帧/信封/验签顺序/16 消息/16 错误码/流程/限额）；`docs/ARCHITECTURE.md` 增第二阶段；`docs/THREAT_MODEL.md` 增第二阶段；全量 **270/270**，compileall exit 0；提交 `c555ea5` |
 
 > **E-1 分页口径修正（实测）**：验收原文写"150 事件→2 批（≤100）"。实测单条 ed25519
 > 记账事件序列化约 600 B，而 `LEDGER_SYNC_RESPONSE` 必须装进 32 KiB 的 body 上限，
