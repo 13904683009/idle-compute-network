@@ -74,14 +74,14 @@ class RawPeer:
     def dial(self, addr: str) -> None:
         self.transport.dial(self.coord_id, [addr])
 
-    def craft(self, type_: MessageType, body: dict) -> bytes:
+    def craft(self, type_: MessageType, body: dict, recipient: str | None = None) -> bytes:
         self._seq += 1
         return encode_envelope(
             build_envelope(
                 type_,
                 self.identity.node_id,
                 self.identity.sign,
-                recipient=self.coord_id,
+                recipient=recipient if recipient is not None else self.coord_id,
                 seq=self._seq,
                 body=body,
             )
@@ -90,8 +90,10 @@ class RawPeer:
     def send(self, frame: bytes) -> None:
         self.transport.send(self.coord_id, frame)
 
-    def send_craft(self, type_: MessageType, body: dict) -> bytes:
-        frame = self.craft(type_, body)
+    def send_craft(
+        self, type_: MessageType, body: dict, recipient: str | None = None
+    ) -> bytes:
+        frame = self.craft(type_, body, recipient=recipient)
         self.send(frame)
         return frame
 

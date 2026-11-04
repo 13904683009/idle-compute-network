@@ -23,6 +23,7 @@ from unittest import mock
 from idle_compute.identity import NodeIdentity
 from idle_compute.protocol import (
     BODY_SCHEMAS,
+    MAX_DISCOVERY_PEERS,
     ErrorCode,
     MessageType,
     ProtocolError,
@@ -173,6 +174,13 @@ def valid_body(type_: MessageType) -> dict:
             ],
             "more": False,
         },
+        # D2: shape-only samples; the discovery layer does the crypto checks.
+        MessageType.CAPABILITY_ANNOUNCE: {
+            "manifest": {"node_id": SENDER, "capability_version": 1},
+            "announcement": {"node_id": SENDER, "sequence": 1},
+        },
+        MessageType.CAPABILITY_QUERY: {"task_type": None, "runtime": None},
+        MessageType.CAPABILITY_RESPONSE: {"query_seq": 1, "peers": []},
     }
     return samples[type_]
 
@@ -456,9 +464,9 @@ class TestTimestamp(unittest.TestCase):
 
 
 class TestBodyRegistry(unittest.TestCase):
-    def test_all_16_types_have_schemas_and_accept_valid_bodies(self):
-        self.assertEqual(len(BODY_SCHEMAS), 16)
-        self.assertEqual(len(MessageType), 16)
+    def test_all_19_types_have_schemas_and_accept_valid_bodies(self):
+        self.assertEqual(len(BODY_SCHEMAS), 19)
+        self.assertEqual(len(MessageType), 19)
         for type_ in MessageType:
             validate_body(type_, valid_body(type_))  # must not raise
 
@@ -575,6 +583,111 @@ class TestGoldenVectors(unittest.TestCase):
         a = encode_envelope(build_envelope(MessageType.PING, SENDER, FAKE.sign, seq=1, body={"nonce": "n"}, ts=FIXED_TS))
         b = encode_envelope(build_envelope(MessageType.PING, SENDER, FAKE.sign, seq=1, body={"nonce": "n"}, ts=FIXED_TS))
         self.assertEqual(a, b)
+
+
+class TestCapabilityMessages(unittest.TestCase):
+    """D2: broadcast vs directed recipient policy + schema/size bounds."""
+
+    def _announce(self, **overrides):
+        body = {
+            "manifest": {"node_id": SENDER, "capability_version": 1},
+            "announcement": {"node_id": SENDER, "sequence": 1},
+        }
+        body.update(overrides)
+        return frame_for(MessageType.CAPABILITY_ANNOUNCE, body, recipient=None)
+
+    def test_broadcast_announce_is_accepted(self):
+        env = parse_frame(self._announce(), local_node_id=SENDER)
+        self.assertIsNone(env.recipient)
+
+    def test_announce_addressed_to_another_node_is_rejected(self):
+        frame = frame_for(MessageType.CAPABILITY_ANNOUNCE, valid_body(MessageType.CAPABILITY_ANNOUNCE), recipient=OTHER)
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.UNAUTHORIZED)
+
+    def test_directed_query_requires_a_recipient(self):
+        frame = frame_for(
+            MessageType.CAPABILITY_QUERY, {"task_type": None, "runtime": None}, recipient=None
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_BODY)
+        self.assertIn("directed", str(ctx.exception))
+
+    def test_directed_response_requires_a_recipient(self):
+        frame = frame_for(
+            MessageType.CAPABILITY_RESPONSE, {"query_seq": 1, "peers": []}, recipient=None
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_BODY)
+
+    def test_query_addressed_to_this_node_is_accepted(self):
+        frame = frame_for(
+            MessageType.CAPABILITY_QUERY,
+            {"task_type": "numeric_batch_v1", "runtime": None},
+            recipient=SENDER,
+        )
+        env = parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(env.body["task_type"], "numeric_batch_v1")
+
+    def test_announce_requires_objects(self):
+        frame = frame_for(
+            MessageType.CAPABILITY_ANNOUNCE,
+            {"manifest": "not-a-dict", "announcement": {}},
+            recipient=None,
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_BODY)
+
+    def test_oversized_manifest_object_is_rejected(self):
+        body = {
+            "manifest": {"pad": "x" * 25_000},
+            "announcement": {},
+        }
+        frame = frame_for(MessageType.CAPABILITY_ANNOUNCE, body, recipient=None)
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_BODY)
+        self.assertIn("larger than", str(ctx.exception))
+
+    def test_too_many_candidates_are_rejected(self):
+        peers = [{"manifest": {}, "announcement": {}} for _ in range(MAX_DISCOVERY_PEERS + 1)]
+        frame = frame_for(
+            MessageType.CAPABILITY_RESPONSE, {"query_seq": 1, "peers": peers}, recipient=SENDER
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_BODY)
+
+    def test_candidate_entry_must_be_an_object(self):
+        frame = frame_for(
+            MessageType.CAPABILITY_RESPONSE, {"query_seq": 1, "peers": ["bad"]}, recipient=SENDER
+        )
+        with self.assertRaises(ProtocolError):
+            parse_frame(frame, local_node_id=SENDER)
+
+    def test_overlong_query_field_is_rejected(self):
+        frame = frame_for(
+            MessageType.CAPABILITY_QUERY, {"task_type": "t" * 65, "runtime": None}, recipient=SENDER
+        )
+        with self.assertRaises(ProtocolError):
+            parse_frame(frame, local_node_id=SENDER)
+
+    def test_announce_with_bad_signature_is_rejected_before_schema(self):
+        frame = self._announce()
+        # Re-use the frame's body but sign with another key: signature must win.
+        tampered = frame_for(
+            MessageType.CAPABILITY_ANNOUNCE,
+            valid_body(MessageType.CAPABILITY_ANNOUNCE),
+            recipient=None,
+            sign=FakeSigner(b"wrong-key").sign,
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(tampered, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.BAD_SIGNATURE)
 
 
 class TestContainment(unittest.TestCase):

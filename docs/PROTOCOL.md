@@ -65,7 +65,7 @@ signature = Ed25519(sender_private_key, canonical)      # 128 hex
 > 顺序的意义：任何"解释 body"的动作（含 schema 校验）都发生在验签之后，
 > 未知/伪造消息不会进入业务解析路径。
 
-## 4. 消息目录（16 种，封闭注册表）
+## 4. 消息目录（19 种，封闭注册表；D2 新增 3 种能力发现消息）
 
 | 类型 | 方向 | body 键（精确） |
 | --- | --- | --- |
@@ -82,10 +82,16 @@ signature = Ed25519(sender_private_key, canonical)      # 128 hex
 | `STATUS_REQUEST` / `STATUS_RESPONSE` | client→coord | `task_id` / `task_id, status, result, validation, credits_count` |
 | `LEDGER_SYNC_REQUEST` | worker→coord | `after_seq` |
 | `LEDGER_SYNC_RESPONSE` | coord→worker | `after_seq, head_seq, events, more` |
+| `CAPABILITY_ANNOUNCE` | 任意→任意 | `manifest, announcement`（广播：`recipient=null`） |
+| `CAPABILITY_QUERY` | 请求方→被查询方 | `task_type, runtime`（定向：必须指定 recipient） |
+| `CAPABILITY_RESPONSE` | 被查询方→请求方 | `query_seq, peers[{manifest, announcement}]`（定向，≤32 条） |
 
 - `*_ACK`/`DENIED` 的 `in_reply_to` 必须指向对应请求的 `seq`。
 - `ERROR` 永不回复 `ERROR`（防回声风暴）。
 - `RENEW`/`RENEW_ACK` **未实现**（阶段 F 计划）。
+- D2：`CAPABILITY_ANNOUNCE` 是唯一允许 `recipient=null` 的业务广播；两条响应/查询消息
+  必须指名收件人，否则 `INVALID_BODY`；收件人不是本机则 `UNAUTHORIZED`（验签之后判定）。
+  详见 `docs/phase2/DISCOVERY-PROTOCOL.md`。
 
 ## 5. 错误码（16）
 
@@ -228,3 +234,20 @@ D1 新增了三份独立协议文档，代码在 `capability.py` / `requirement.
 **D2/D4 添加线上消息时必须**：更新 `MessageType`、`_BODY_KEYS`、`_check_*` schema、
 角色分发集合（`_COORD_HANDLED` / `_WORKER_REPLY_TYPES` / `_CLIENT_REPLY_TYPES`）以及
 `test_protocol.py` 中"类型数量"的断言；不得走"给现有消息加字段"的路径（精确键集 + `v==1` 会直接拒绝）。
+
+## 12a. D2 扩展（能力发现已上线）
+
+D2 把能力发现接到线协议上：封闭注册表 **16 → 19**，新增
+`CAPABILITY_ANNOUNCE` / `CAPABILITY_QUERY` / `CAPABILITY_RESPONSE`。
+完整规则（校验顺序、去重/回滚/撤销、缓存容量与淘汰、持久化、在线 vs 公告有效）见
+`docs/phase2/DISCOVERY-PROTOCOL.md`。
+
+要点：
+
+| 项 | 值 |
+| --- | --- |
+| 广播/定向 | 只有 `CAPABILITY_ANNOUNCE` 可 `recipient=null`；查询/响应必须指名收件人 |
+| 嵌套对象上限 | manifest / announcement 各 24 KiB；一个响应 ≤32 条候选 |
+| 接收顺序 | schema → 身份绑定 → manifest 签名/时间 → announcement 签名/时间 → 重复 → 序号 → 版本 → 撤销 → 大小 → 容量 → **持久化** → 内存 |
+| 远端过期 | 被本地钳制到 `received_at + max_announcement_ttl`（默认 120 s） |
+| 持久化 | `<data_dir>/discovery.db`（独立于账本；不改 v2 schema） |

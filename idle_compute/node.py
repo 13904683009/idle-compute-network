@@ -53,8 +53,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import ledger
+from .capability import CapabilityError
 from .config import NodeConfig, ValidationError, is_valid_node_id
 from .db import DuplicateSubmission, LeaseExpired, Store, TaskUnavailable
+from .discovery import (
+    ACCEPTED,
+    AnnouncementCache,
+    DiscoveryStateStore,
+    build_announcement,
+    build_manifest,
+)
 from .identity import NodeIdentity
 from .log import install_redaction
 from .models import Lease, LeaseStatus, Task, TaskStatus, ValidationStatus, new_id, utc_now
@@ -269,6 +277,13 @@ class Node:
         # _worker_loop so an in-place edit of an already-mirrored event is not
         # invisible to incremental pulls.
         self._audit_cursor: int | None = None
+        # D2 discovery: the cache (and its sqlite state) is created lazily so
+        # constructing a Node for validation does not touch the filesystem.
+        self._discovery: AnnouncementCache | None = None
+        self._discovery_store: DiscoveryStateStore | None = None
+        self._discovery_lock = threading.Lock()
+        self._publish_sequence = 0
+        self._last_publish_at = 0.0
 
     # ------------------------------------------------------------------ seq
 
@@ -477,7 +492,14 @@ class Node:
             if env.type is MessageType.HELLO:
                 self._reply(write, MessageType.HELLO_ACK, self._hello_body(), env)
                 continue
-            if not self._on_envelope(env, write):
+            try:
+                if not self._on_envelope(env, write):
+                    return
+            except Exception:
+                # A bug in one handler must not kill the stream silently: log
+                # it, tell the peer, keep the node serving other streams.
+                logger.exception("envelope handler failed for %s", env.type.value)
+                self._reply_error(write, ErrorCode.INTERNAL, "internal error", env)
                 return
 
     def _on_parse_error(self, exc: ProtocolError, frame: bytes, write: Callable[[bytes], None]) -> None:
@@ -513,8 +535,190 @@ class Node:
         except Exception:
             return
 
+    # ------------------------------------------------------- discovery (D2)
+
+    def _discovery_cache(self) -> AnnouncementCache:
+        """Lazily open the announcement cache + its persisted state file."""
+        cache = self._discovery
+        if cache is not None:
+            return cache
+        with self._discovery_lock:
+            if self._discovery is not None:
+                return self._discovery
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            cfg = self.config.discovery
+            self._discovery_store = DiscoveryStateStore(self._data_dir / "discovery.db")
+            self._discovery = AnnouncementCache(
+                max_entries=cfg.max_entries,
+                max_ttl_seconds=cfg.max_announcement_ttl_seconds,
+                offline_after_seconds=cfg.offline_after_seconds,
+                state_store=self._discovery_store,
+            )
+            return self._discovery
+
+    def _handle_discovery(self, env: Any, write: Callable[[bytes], None]) -> bool:
+        cache = self._discovery_cache()
+        now = time.time()
+        if env.type is MessageType.CAPABILITY_ANNOUNCE:
+            with self._discovery_lock:
+                result = cache.ingest(
+                    env.body["manifest"],
+                    env.body["announcement"],
+                    now=now,
+                    sender_node_id=env.sender,
+                )
+            if result.accepted:
+                logger.debug("capability announcement accepted from %s", env.sender[:12])
+            else:
+                logger.info(
+                    "capability announcement rejected from %s: %s (%s)",
+                    env.sender[:12],
+                    result.code,
+                    result.detail,
+                )
+            return True
+        if env.type is MessageType.CAPABILITY_QUERY:
+            with self._discovery_lock:
+                peers = cache.lookup(
+                    task_type=env.body["task_type"],
+                    runtime=env.body["runtime"],
+                    now=now,
+                )
+                payload = [
+                    {"manifest": peer.manifest.to_dict(), "announcement": peer.announcement.to_dict()}
+                    for peer in peers
+                ]
+            self._reply(
+                write,
+                MessageType.CAPABILITY_RESPONSE,
+                {"query_seq": env.seq, "peers": payload},
+                env,
+            )
+            return True
+        if env.type is MessageType.CAPABILITY_RESPONSE:
+            accepted = 0
+            with self._discovery_lock:
+                for entry in env.body["peers"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    result = cache.ingest(
+                        entry.get("manifest"), entry.get("announcement"), now=now
+                    )
+                    if result.accepted:
+                        accepted += 1
+            self._replies.put(env)  # let a waiting query_capabilities() see it
+            logger.debug(
+                "capability response from %s: %d/%d entries accepted",
+                env.sender[:12],
+                accepted,
+                len(env.body["peers"]),
+            )
+            return True
+        return False
+
+    def publish_announcement(self) -> dict[str, Any]:
+        """Build+sign this node's announcement and broadcast it (best effort).
+
+        The node's own sequence is persisted before sending, so a restart
+        continues monotonically instead of being rejected as a rollback.
+        """
+        template = self.config.capability
+        if not template:
+            raise NodeError("config has no 'capability' section to announce")
+        now = int(time.time())
+        manifest = build_manifest(template, self.identity, now=now)
+        cache = self._discovery_cache()
+        with self._discovery_lock:
+            if self._publish_sequence == 0 and self._discovery_store is not None:
+                self._publish_sequence = self._discovery_store.last_sequence(self.identity.node_id)
+            self._publish_sequence += 1
+            sequence = self._publish_sequence
+            ttl = min(60, self.config.discovery.max_announcement_ttl_seconds)
+            announcement = build_announcement(
+                manifest, template, self.identity, now=now, sequence=sequence, ttl_seconds=ttl
+            )
+            if self._discovery_store is not None:
+                try:
+                    self._discovery_store.record(
+                        self.identity.node_id,
+                        sequence,
+                        manifest.capability_version,
+                        manifest.hash(),
+                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                    )
+                except sqlite3.Error as exc:
+                    raise NodeError(f"cannot persist own announcement sequence: {exc}") from exc
+        body = {"manifest": manifest.to_dict(), "announcement": announcement.to_dict()}
+        sent = failed = 0
+        for peer in self.config.peers:
+            try:
+                self._send_to(peer, MessageType.CAPABILITY_ANNOUNCE, body)
+                sent += 1
+            except TransportError as exc:
+                failed += 1
+                logger.debug("announcement to %s failed: %s", peer[:12], exc)
+        self._last_publish_at = time.time()
+        return {"sequence": sequence, "sent": sent, "failed": failed}
+
+    def query_capabilities(
+        self,
+        peer_id: str,
+        *,
+        task_type: str | None = None,
+        runtime: str | None = None,
+        timeout: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Ask ``peer_id`` for its cached capabilities (directed request/reply)."""
+        timeout = float(self.config.discovery.query_timeout_seconds if timeout is None else timeout)
+        if not self._connected:
+            # A client Node has not dialed yet; workers are already connected.
+            self._client_ensure_connected(timeout)
+        seq = self._send_to(
+            peer_id,
+            MessageType.CAPABILITY_QUERY,
+            {"task_type": task_type, "runtime": runtime},
+        )
+        env = self._await(
+            lambda e: e.type is MessageType.CAPABILITY_RESPONSE and e.body.get("query_seq") == seq,
+            timeout,
+            seq,
+        )
+        return list(env.body["peers"])
+
+    def _discovery_tick(self) -> None:
+        """Sweep expiry/liveness and publish our announcement when due."""
+        cfg = self.config.discovery
+        now = time.time()
+        cache = self._discovery_cache()
+        with self._discovery_lock:
+            swept = cache.sweep(now)
+        if swept["removed"] or swept["unreachable"]:
+            logger.debug("discovery sweep: %s", swept)
+        if self.config.capability and (now - self._last_publish_at) >= cfg.announce_interval_seconds:
+            try:
+                stats = self.publish_announcement()
+                logger.info(
+                    "published capability announcement seq=%s sent=%s failed=%s",
+                    stats["sequence"],
+                    stats["sent"],
+                    stats["failed"],
+                )
+            except (NodeError, CapabilityError, TransportError) as exc:
+                logger.warning("capability announcement failed: %s", exc)
+
     def _on_envelope(self, env: Any, write: Callable[[bytes], None]) -> bool:
         """Dispatch an authenticated envelope; False closes the stream."""
+        # Liveness: any authenticated frame from a cached peer proves it is
+        # reachable right now (valid announcement != online).
+        if self._discovery is not None and env.sender:
+            with self._discovery_lock:
+                self._discovery.mark_alive(env.sender)
+        if env.type in (
+            MessageType.CAPABILITY_ANNOUNCE,
+            MessageType.CAPABILITY_QUERY,
+            MessageType.CAPABILITY_RESPONSE,
+        ):
+            return self._handle_discovery(env, write)
         if env.type is MessageType.PING:
             self._reply(
                 write,
@@ -932,6 +1136,10 @@ class Node:
                 except Exception:
                     logger.exception("lease expiry failed")
                 try:
+                    self._discovery_tick()
+                except Exception:
+                    logger.exception("discovery tick failed")
+                try:
                     env, write = self._work.get(timeout=self.config.poll_interval_seconds)
                 except queue.Empty:
                     continue
@@ -976,6 +1184,10 @@ class Node:
                             self._claim_cycle(coordinator)
                         except NodeTimeoutError:
                             pass  # nothing claimable this round
+                    try:
+                        self._discovery_tick()
+                    except Exception:
+                        logger.exception("discovery tick failed")
                     self._stopping.wait(self.config.poll_interval_seconds)
                     # Reset only after a FULL healthy cycle: dial-then-fail
                     # loops must keep doubling, not reconnect at backoff_min
@@ -1323,6 +1535,15 @@ class Node:
                 self._aux.close()
         except Exception as exc:
             logger.debug("closing the aux connection failed: %s", exc)
+        # D2 discovery state (opened lazily on whichever thread first needed
+        # it; the sqlite connection is only touched under _discovery_lock).
+        try:
+            if self._discovery_store is not None:
+                self._discovery_store.close()
+        except Exception as exc:
+            logger.debug("closing the discovery state failed: %s", exc)
+        self._discovery_store = None
+        self._discovery = None
         # Detach the per-node file handler last: after this the log file is
         # closed and (on Windows) no longer locked against deletion.
         self._detach_log_handler()

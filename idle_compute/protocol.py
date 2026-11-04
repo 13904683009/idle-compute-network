@@ -60,6 +60,10 @@ MAX_SYNC_PAGE_EVENTS = 100
 # Per-event bound inside a LEDGER_SYNC_RESPONSE page (metadata is the only
 # unbounded string in a credit row).
 MAX_EVENT_METADATA = 2048
+# D2 discovery bounds: a signed manifest/announcement object must stay well
+# inside MAX_BODY_BYTES, and one response can carry a bounded candidate list.
+MAX_CAPABILITY_OBJECT_BYTES = 24 * 1024
+MAX_DISCOVERY_PEERS = 32
 
 _B58_ALPHABET = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 _NODE_ID_PREFIX = "12D3KooW"
@@ -98,7 +102,7 @@ class ProtocolError(Exception):
 
 
 class MessageType(str, Enum):
-    """Closed registry of wire message types (16)."""
+    """Closed registry of wire message types (19 since D2)."""
 
     HELLO = "HELLO"
     HELLO_ACK = "HELLO_ACK"
@@ -116,6 +120,17 @@ class MessageType(str, Enum):
     STATUS_RESPONSE = "STATUS_RESPONSE"
     LEDGER_SYNC_REQUEST = "LEDGER_SYNC_REQUEST"
     LEDGER_SYNC_RESPONSE = "LEDGER_SYNC_RESPONSE"
+    # D2 capability discovery (see PROTOCOL.md §12a / DISCOVERY-PROTOCOL.md)
+    CAPABILITY_ANNOUNCE = "CAPABILITY_ANNOUNCE"
+    CAPABILITY_QUERY = "CAPABILITY_QUERY"
+    CAPABILITY_RESPONSE = "CAPABILITY_RESPONSE"
+
+
+# D2 recipient policy: a broadcast may be sent with recipient=null; a directed
+# message must name exactly one recipient. Everything else keeps the pre-D2
+# rule (recipient optional, checked against the local node when known).
+BROADCAST_TYPES = frozenset({MessageType.CAPABILITY_ANNOUNCE})
+DIRECTED_TYPES = frozenset({MessageType.CAPABILITY_QUERY, MessageType.CAPABILITY_RESPONSE})
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +661,61 @@ def _check_ledger_sync_response(value: Any) -> None:
         _check_sync_event(event)
 
 
+# --- D2 capability discovery ------------------------------------------------
+#
+# These schemas validate SHAPE and SIZE only (exact keys, dict-ness, bounds).
+# Cryptographic and semantic validation of manifest/announcement happens in
+# idle_compute.discovery with idle_compute.capability, AFTER the envelope
+# signature — protocol.py stays libp2p-free and does not import capability.
+
+
+def _check_capability_objects(value: Any, label: str) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, f"{label} must be a JSON object")
+    if len(canonical_json(value)) > MAX_CAPABILITY_OBJECT_BYTES:
+        raise ProtocolError(
+            ErrorCode.INVALID_BODY,
+            f"{label} larger than {MAX_CAPABILITY_OBJECT_BYTES} bytes",
+        )
+
+
+def _check_capability_announce(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "CAPABILITY_ANNOUNCE body must be an object")
+    _check_capability_objects(value.get("manifest"), "manifest")
+    _check_capability_objects(value.get("announcement"), "announcement")
+
+
+def _check_capability_query(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "CAPABILITY_QUERY body must be an object")
+
+    def _nullable_short(item: Any, label: str) -> None:
+        if item is not None and not (isinstance(item, str) and 0 < len(item) <= 64):
+            raise ProtocolError(
+                ErrorCode.INVALID_BODY, f"CAPABILITY_QUERY {label} must be null or a short string"
+            )
+
+    _nullable_short(value.get("task_type"), "task_type")
+    _nullable_short(value.get("runtime"), "runtime")
+
+
+def _check_capability_response(value: Any) -> None:
+    if not (
+        isinstance(value, dict)
+        and isinstance(value.get("query_seq"), int)
+        and value["query_seq"] >= 0
+        and isinstance(value.get("peers"), list)
+        and len(value["peers"]) <= MAX_DISCOVERY_PEERS
+    ):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "CAPABILITY_RESPONSE body shape invalid")
+    for entry in value["peers"]:
+        if not isinstance(entry, dict):
+            raise ProtocolError(ErrorCode.INVALID_BODY, "CAPABILITY_RESPONSE peers must be objects")
+        _check_capability_objects(entry.get("manifest"), "manifest")
+        _check_capability_objects(entry.get("announcement"), "announcement")
+
+
 BODY_SCHEMAS: dict[MessageType, Callable[[Any], None]] = {
     MessageType.HELLO: _check_hello,
     MessageType.HELLO_ACK: _check_hello_ack,
@@ -663,6 +733,9 @@ BODY_SCHEMAS: dict[MessageType, Callable[[Any], None]] = {
     MessageType.STATUS_RESPONSE: _check_status_response,
     MessageType.LEDGER_SYNC_REQUEST: _check_ledger_sync_request,
     MessageType.LEDGER_SYNC_RESPONSE: _check_ledger_sync_response,
+    MessageType.CAPABILITY_ANNOUNCE: _check_capability_announce,
+    MessageType.CAPABILITY_QUERY: _check_capability_query,
+    MessageType.CAPABILITY_RESPONSE: _check_capability_response,
 }
 
 
@@ -694,6 +767,9 @@ _BODY_KEYS: dict[MessageType, tuple[str, ...]] = {
     MessageType.STATUS_RESPONSE: ("task_id", "status", "result", "validation", "credits_count"),
     MessageType.LEDGER_SYNC_REQUEST: ("after_seq",),
     MessageType.LEDGER_SYNC_RESPONSE: ("after_seq", "head_seq", "events", "more"),
+    MessageType.CAPABILITY_ANNOUNCE: ("manifest", "announcement"),
+    MessageType.CAPABILITY_QUERY: ("task_type", "runtime"),
+    MessageType.CAPABILITY_RESPONSE: ("query_seq", "peers"),
 }
 
 
@@ -780,14 +856,20 @@ def parse_message(
     if not verifier(sender, payload, signature):
         raise ProtocolError(ErrorCode.BAD_SIGNATURE, "envelope signature invalid")
 
-    # D1: recipient binding. Only after the signature so an attacker cannot use
-    # this as an unauthenticated oracle, and only when the caller knows who it
-    # is (None = broadcast, always accepted).
-    if local_node_id is not None and recipient is not None and recipient != local_node_id:
-        raise ProtocolError(
-            ErrorCode.UNAUTHORIZED,
-            f"message recipient {recipient[:12]}... is not this node",
-        )
+    # D1/D2: recipient binding. Only after the signature so an attacker cannot
+    # use this as an unauthenticated oracle, and only when the caller knows who
+    # it is (None = no enforcement, e.g. manual test peers).
+    if local_node_id is not None:
+        if type_ in DIRECTED_TYPES and recipient is None:
+            raise ProtocolError(
+                ErrorCode.INVALID_BODY,
+                f"{type_.value} is a directed message and requires a recipient",
+            )
+        if recipient is not None and recipient != local_node_id:
+            raise ProtocolError(
+                ErrorCode.UNAUTHORIZED,
+                f"message recipient {recipient[:12]}... is not this node",
+            )
 
     seq_window.check_and_update(sender, seq)
     check_timestamp(ts, now=now)
