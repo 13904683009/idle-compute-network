@@ -33,7 +33,7 @@ ANNOUNCEMENT_DOMAIN = "idle-compute-announcement-v1"
 REVOCATION_DOMAIN = "idle-compute-capability-revoke-v1"
 
 CLOCK_SKEW_SECONDS = 300
-MAX_TASK_TYPES = 32
+MAX_TASK_TYPE_ENTRIES = 32
 MAX_RUNTIMES = 32
 MAX_TRANSPORTS = 8
 MAX_REASON = 200
@@ -240,7 +240,7 @@ def _validate_manifest(manifest: CapabilityManifest) -> None:
     _int_field(manifest.expires_at, "expires_at", 1)
     _require(manifest.expires_at > manifest.issued_at, "expires_at must be after issued_at")
 
-    task_types = _str_list(manifest.supported_task_types, "supported_task_types", MAX_TASK_TYPES)
+    task_types = _str_list(manifest.supported_task_types, "supported_task_types", MAX_TASK_TYPE_ENTRIES)
     _require(len(task_types) >= 1, "supported_task_types must not be empty")
     _str_list(manifest.supported_runtimes, "supported_runtimes", MAX_RUNTIMES)
 
