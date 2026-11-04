@@ -122,3 +122,46 @@ F-1 完成后，以下"未实现"陈述已同步改写，否则 `tests/test_docs
 - HEAD `0f4fc5e`；无 remote；无 amend/reset/rebase。
 - 回滚点：`5af245e`（F-1 完成，278 绿）、`f52a502`（阶段 E，270 绿）。
 - 剩余：F-3（线边界 + 源码扫描）、F-4（日志脱敏），随后 G-1/G-2、H、I。
+
+---
+
+# 追加：F-3（线边界 + 注册表分发 + 源码门禁）
+
+提交：`1ff7d4f`。基线：`4fda429`（282 测试）→ `1ff7d4f`（**288 测试**）。
+
+## 9. F-3 交付内容
+
+- **`tests/helpers/peers.py`（新增）**：可复用的裸 TCP 对等方（真实帧、真实 socket），
+  兼容 `unittest discover` 与 `python -m unittest tests.x` 两种导入方式。
+- **`tests/test_wire_boundary.py`（新增 3 项）**：对真实协调者发送恶意帧，并**给执行器打点**：
+  - 10 类载荷（5000 个数、bool、float、字符串/shell 元字符、多余键、嵌套列表、
+    非白名单类型、带 shell 元字符的类型名）全部被拒，`NumericBatchTask.execute`
+    **一次都没被调用**；随后直接调用一次执行器作为**正控**，证明打点有效；
+  - 未知消息类型：线上被拒（撤销注册表级断言，独立于签名顺序验证 `UNSUPPORTED_TYPE`）；
+  - 深度 20 的 JSON 炸弹：被丢弃、不当作 PING 处理、节点继续服务
+    （并记录根因：`_on_parse_error` 需要重新解析原始帧才能寻址回复，解析不了就不猜、静默丢弃）。
+- **`tests/test_source_safety.py`（+3 项，共 5 项）**：
+  - libp2p 导入仅限 `identity.py` / `net_transport.py`；
+  - 包内无 `asyncio` 导入；
+  - `TASK_TYPES` 只在 `tasks.py` 定义；Phase-2 运行时（`worker.py`/`node.py`/两种传输）
+    不得直接引用具体任务类，只能经 `get_task_type()` 取执行器。
+    （`coordinator.py` 属 Phase 1 本地编排，允许直接引用——已在断言与注释中标明。）
+
+## 10. F-3 测试证据
+
+```powershell
+.venv\Scripts\python.exe -m unittest tests.test_wire_boundary tests.test_source_safety
+→ Ran 8 tests → OK
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+→ Ran 288 tests in 326.460s → OK（exit 0）
+.venv\Scripts\python.exe -m compileall -q idle_compute tests
+→ exit 0
+```
+
+日志：`C:\Users\linxi\Desktop\DSH工作区\logs\idle-compute\f3-full-suite.log`
+
+## 11. F-3 后的 Git 状态
+
+- HEAD `1ff7d4f`；无 remote；无 amend/reset/rebase。
+- 回滚点：`4fda429`（F-2 完成，282 绿）、`5af245e`（F-1，278 绿）。
+- 剩余：F-4（日志脱敏）→ G-1/G-2 → H → I；双设备验证仍未执行。
