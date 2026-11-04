@@ -61,7 +61,7 @@
 
 未列名单 HELLO / 坏签名 HELLO / 畸形帧 / 超大帧 → 关流（可回 ERROR）。
 
-## 5. 消息类型（14）
+## 5. 消息类型（16）
 
 | 类型 | 方向 | 作用 |
 | --- | --- | --- |
@@ -71,9 +71,11 @@
 | CLAIM_REQUEST / CLAIM_GRANT / CLAIM_DENIED | worker→coord | 领取任务；grant 内联 lease + task{type,payload}；denied 结束本轮；已知 claim_request_id 永不新铸租约（§6） |
 | SUBMIT_RESULT / RESULT_ACK | worker→coord | 提交签名结果；ack 内联 `validation ∈ {VALID, INVALID}` 与 credit；同 peer 重放→**原 RESULT_ACK 重放**（幂等积分）；异 peer→不泄露信息的拒绝（`TASK_UNAVAILABLE`） |
 | STATUS_REQUEST / STATUS_RESPONSE | client→coord | 查询任务状态（含 result/validation/credits_count） |
+| LEDGER_SYNC_REQUEST / LEDGER_SYNC_RESPONSE | worker→coord | 账本分页拉取：请求 `{after_seq}`；响应 `{after_seq, head_seq, events, more}`，单页 count≤100 且序列化≤24 KiB（必须装进 32 KiB body 上限）；事件为 13 列导出行的精确键 schema（`sig_algo` 必须 `ed25519`，`event_type` 必须等于 `CreditEventType.CREDIT.value`） |
 | ERROR | 任意 | 16 种错误码，`in_reply_to` 指向触发消息的 seq |
 
-续租（RENEW）与账本同步（LEDGER_SYNC）**未实现**，按计划留阶段 E/F。
+续租（RENEW）**未实现**（阶段 F 计划）。
+账本同步（LEDGER_SYNC）已在 E-1 交付：工人每轮主动分页拉取、逐事件验签后写入镜像；失败/分歧置冲突锁存并停止 claim（E-2 继续做隔离与重建恢复）。
 
 ## 6. 状态机集成（网络输入不绕过安全边界）
 
@@ -82,7 +84,7 @@
 - TASK_CREATE：白名单校验 → `store.create_task`（仅 `numeric_batch_v1`，其他类型拒）。
 - CLAIM_REQUEST：`claims` 表 **INSERT OR IGNORE**（审计修复：不再 upsert）→ 已知 claim_request_id 从不铸新租约：行已存在且租约仍 ACTIVE 且同 worker → 返回原租约；否则 CLAIM_DENIED；task 处于 `LEASED` 时先 `start_task` 推进到 `RUNNING`（否则后续 submit 会 `InvalidTransition`）→ CLAIM_GRANT。
 - SUBMIT_RESULT：**先查重复结果** → 同 worker 重放：回原 RESULT_ACK（含原 credit 事件，幂等，不改任何状态）；异 worker：租约归属门直接拒绝（`TASK_UNAVAILABLE`，不泄露结果是否存在）→ 租约校验（`LEASE_EXPIRED`）→ `validate_result`（独立重算 + 内容哈希 + HMAC/Ed25519 验签）→ VALID 才 `submit_result` 记账。
-- 记账：协调者按现有 ledger 哈希链写事件；工人镜像 `ledger_copy` 表，`ledger.verify_and_append`（逐事件验签 + 哈希链）通过才追加，`verified=1`。
+- 记账：协调者按现有 ledger 哈希链写事件；工人侧有两条入账路径——RESULT_ACK 内联 credit 事件、以及每轮循环先做的 `LEDGER_SYNC` 分页拉取——两条都走 `ledger.verify_and_append`（逐事件验签 + 哈希链 + seq 连续）通过才追加，`verified=1`。任何一条失败都置 `_ledger_conflict` 锁存：不跳过、不覆盖、不回卷，并在该锁存清除前停止 claim。
 
 **失败任务不获得积分**（INVALID→无记账）、**重复任务不重复记分**（同 peer 重放→单记账）、**无效结果不进入已验证状态**——均有对抗测试覆盖（伪造结果、重复 claim、重复提交、异 peer 重放、错输出）。
 
@@ -100,7 +102,8 @@
 - **seq 回滚自愈**（审计修复）：若 seq.json 丢失/回滚导致 HELLO 落后于协调者窗口，协调者回 `SEQ_OUT_OF_WINDOW`（消息含 `last_seen N`），工人解析后把出站 seq 跳到 N 并重试——不会永久卡死（测试：删除 seq.json 后第二个任务仍被验证）。
 - 协调者重启：工人 1..8s 退避重拨，重连后恢复轮询（coordinator-restart 测试覆盖）。
 - seq 持久化防御性处理：node_state 读写失败仅记日志（窗口退回内存态），永不杀死处理线程；仅白名单 peer 的窗口被持久化。
-- 线程亲和性：Store 与镜像连接各自**懒创建于所属 loop 线程**（sqlite3 连接绑定创建线程）；`_aux` 连接（node_state/claims/client_refs）`check_same_thread=False` + 锁，并在 `__init__` 里先 bootstrap 建 schema（处理线程可能先于 loop 查询）。
+- 线程亲和性：Store 与镜像连接各自**懒创建于所属 loop 线程**（sqlite3 连接绑定创建线程），并**在同一个 loop 线程的 `finally` 里关闭**；关闭动作若跨线程执行会被 sqlite3 拒绝，句柄泄漏会让 DB 文件在 shutdown 后仍被锁（E-1 测试暴露并修复）。`_aux` 连接（node_state/claims/client_refs）`check_same_thread=False` + 锁，并在 `__init__` 里先 bootstrap 建 schema（处理线程可能先于 loop 查询）。
+- 日志句柄：每个节点的 `log_file` FileHandler 挂在 `idle_compute` logger 上，`shutdown()` 时摘除并关闭；否则文件在节点停止后仍被占用（同上，Windows 下不可删除）。
 
 ## 8. 资源与安全限制（现网值）
 

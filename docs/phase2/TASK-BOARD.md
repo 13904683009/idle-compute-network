@@ -43,8 +43,8 @@
 
 ## 阶段 D（应用协议）
 
-> 已随 WAVE 1 交付（见上注）；RENEW/续租、LEDGER_SYNC、并发任务上限等按原计划
-> 属于阶段 E/F，未提前实现。
+> 已随 WAVE 1 交付（见上注）；RENEW/续租、并发任务上限等按原计划属于阶段 F，未提前实现；
+> LEDGER_SYNC 已在阶段 E-1 交付（见下表）。
 
 | ID | 任务 | 负责人 | 状态 | 验收标准 | 证据 |
 | --- | --- | --- | --- | --- | --- |
@@ -56,9 +56,15 @@
 
 | ID | 任务 | 负责人 | 状态 | 验收标准 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| E-1 | LEDGER_SYNC 分页拉取 + 工人链验证至字节一致镜像 | 待定 | todo | 同步后 ledger_copy 与协调者链逐列一致；150 事件→2 批（≤100）无缺无重；after_seq 超头→空页+当前头；每事件验签+prev_hash+amount>0 后才追加；坏事件不追加并报告 seq | — |
+| E-1 | LEDGER_SYNC 分页拉取 + 工人链验证至字节一致镜像 | 主循环 | done | 同步后 ledger_copy 与协调者链逐列一致（13 列逐字段比对 + 规范序列化逐字节一致）；分页 count≤100 且单页序列化≤24 KiB，无缺无重、尾页 `more=False`；after_seq 超头→空页+当前头；每事件验签+prev_hash+amount>0 后才追加；坏事件不追加且错误信息带 event_id/seq | tests/test_ledger_sync.py 9/9（真实子进程 150 事件镜像逐列一致、断点续传、坏事件截断、线 schema 一致 + `event_type` 漂移守卫）；tests/test_node.py ShutdownTests 新增 DB 句柄释放回归；全量 **259/259**，compileall exit 0；提交 `d2046bf` |
 | E-2 | 工人冲突检测 + 隔离 + 删除重建恢复 | 待定 | todo | 协调者链被篡改→工人 CONFLICT 停止 claim；工人不回卷不分叉；删 worker.db→从 0 全量重建一致链；双花重放→双方恰 1 事件；hmac 行注入→CONFLICT | — |
 | E-3 | docs/COORDINATION.md 诚实表 + 架构/协议/威胁模型更新 | 待定 | todo | 三类表逐字落档（协调者权威/工人可验/明确非去中心化）；"防篡改 ≠ 共识"表述；THREAT_MODEL 新增行；grep 级测试禁止文档声称共识/DHT/mDNS/UPnP | — |
+
+> **E-1 分页口径修正（实测）**：验收原文写"150 事件→2 批（≤100）"。实测单条 ed25519
+> 记账事件序列化约 600 B，而 `LEDGER_SYNC_RESPONSE` 必须装进 32 KiB 的 body 上限，
+> 因此分页同时受 count（≤100）与字节（≤24 KiB）双钳制，150 事件实际为 4 页
+> （约 42/42/42/24）。"2 批"的分页假设不成立；可验收的是分页契约本身
+> （无缺无重、尾页 `more=False`、超头空页），已由 tests/test_ledger_sync.py 固定。
 
 ## 阶段 F（安全加固）
 
