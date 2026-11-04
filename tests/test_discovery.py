@@ -285,5 +285,50 @@ class LookupAndLifecycleTests(DiscoveryTestBase):
         self.assertFalse(self.store.is_revoked(self.peer_a.node_id, 1))
 
 
+class EvictionAuditTests(DiscoveryTestBase):
+    """D3 audit: eviction must never reset the anti-rollback state."""
+
+    def test_eviction_does_not_reset_anti_rollback_state(self) -> None:
+        cache = AnnouncementCache(state_store=self.store, clock=self.clock, max_entries=1)
+        manifest_a, announcement_a = self.signed(self.peer_a, seq=5)
+        self.assertEqual(cache.ingest(manifest_a, announcement_a, now=self.clock.now).code, ACCEPTED)
+
+        self.clock.now += 1
+        manifest_b, announcement_b = self.signed(self.peer_b, seq=1)
+        self.assertEqual(cache.ingest(manifest_b, announcement_b, now=self.clock.now).code, ACCEPTED)
+        self.assertEqual(cache.stats()["entries"], 1, "A must have been evicted")
+
+        # A's highest accepted sequence survives in memory AND in discovery.db:
+        # replaying seq=5 after eviction is still a rollback.
+        replay = build_announcement(
+            manifest_a, dict(TEMPLATE), self.peer_a, now=int(self.clock.now), sequence=5
+        )
+        self.assertEqual(cache.ingest(manifest_a, replay, now=self.clock.now).code, SEQ_ROLLBACK)
+        self.assertEqual(self.store.last_sequence(self.peer_a.node_id), 5)
+
+        # A genuinely newer announcement can re-fill the cache.
+        newer = build_announcement(
+            manifest_a, dict(TEMPLATE), self.peer_a, now=int(self.clock.now), sequence=6
+        )
+        self.assertEqual(cache.ingest(manifest_a, newer, now=self.clock.now).code, ACCEPTED)
+
+    def test_eviction_then_restart_still_rejects_the_old_sequence(self) -> None:
+        cache = AnnouncementCache(state_store=self.store, clock=self.clock, max_entries=1)
+        manifest_a, announcement_a = self.signed(self.peer_a, seq=9)
+        self.clock.now += 1
+        manifest_b, announcement_b = self.signed(self.peer_b, seq=1)
+        self.assertEqual(cache.ingest(manifest_a, announcement_a, now=self.clock.now).code, ACCEPTED)
+        self.assertEqual(cache.ingest(manifest_b, announcement_b, now=self.clock.now).code, ACCEPTED)
+
+        self.store.close()
+        reopened = DiscoveryStateStore(self.root / "discovery.db")
+        self.addCleanup(reopened.close)
+        restarted = AnnouncementCache(state_store=reopened, clock=self.clock)
+        replay = build_announcement(
+            manifest_a, dict(TEMPLATE), self.peer_a, now=int(self.clock.now), sequence=9
+        )
+        self.assertEqual(restarted.ingest(manifest_a, replay, now=self.clock.now).code, SEQ_ROLLBACK)
+
+
 if __name__ == "__main__":
     unittest.main()
