@@ -37,9 +37,10 @@
 
 1. `BAD_SENDER`：发送方声明 ≠ 传输对端身份（libp2p 用 `stream.muxed_conn.peer_id`；TCP 无对端身份，用 HELLO 绑定流后校验——见 §4）。
 2. 签名验证（Ed25519，`NodeIdentity.verify_signature`）。
-3. seq 窗口：`(last_seen, last_seen+4096]`，按 sender 持久化（node_state 表，重启后旧帧重放仍拒绝）。
-4. 时间戳 ±300s（HELLO 握手期间放宽到 ±600s，容忍慢拨号）。
-5. 精确键 body schema（`BODY_SCHEMAS`，14 种消息类型各自的允许键集合；多余键/缺失键拒绝）。
+3. **收件人绑定（D1）**：`recipient` 非空且 ≠ 本机 `node_id` → `UNAUTHORIZED`；`recipient=null` 为广播。检查在验签之后，不做未认证探测面。
+4. seq 窗口：`(last_seen, last_seen+4096]`，按 sender 持久化（node_state 表，重启后旧帧重放仍拒绝）。
+5. 时间戳 ±300s（HELLO 握手期间放宽到 ±600s，容忍慢拨号）。
+6. 精确键 body schema（`BODY_SCHEMAS`，16 种消息类型各自的允许键集合；多余键/缺失键拒绝）。
 
 解析错误→尽力回 `ERROR`（仅当发送方身份有效），恶意/畸形输入一律关流，不影响其他流。
 
@@ -114,6 +115,12 @@
 - seq 窗口 4096；内存窗口有界（max_entries 1024，溢出时驱逐非白名单条目）；时间戳 ±300s（握手 ±600s）；重试/退避 1..8s 封顶。
 - 任务超时/租约时长由任务参数决定（默认 30s 租约、max_attempts 3）。
 - 网络默认监听**仅回环或显式配置的地址**；公网监听需独立安全评估与授权（本阶段未做）。
+- 传输安全（D1）：libp2p 适配器**只注册 Noise + TLS**（`sec_opt`），不再提供 `/plaintext/2.0.0`
+  或 `/secio`；`negotiated_security_protocol` 可断言；只提供明文的 peer 在握手阶段被拒（fail-closed）。
+  证据：`tests/test_security_negotiation.py`（注册表精确匹配 / 双方协商值 / 明文 peer 被拒）。
+  **仍不宣称应用层加密**：payload 明文落库且明文上线，链路加密只保护传输段。
+- 收件人（D1）：入站 `recipient` 非空且 ≠ 本机 → `UNAUTHORIZED`（验签后检查）；`recipient=null` 为广播。
+  证据：`tests/test_protocol.py::TestRecipientBinding`、`test_node.py::test_message_for_another_recipient_is_not_processed`。
 - 密钥/HMAC 密钥/令牌：不写入日志、不出现在任何消息体、不入库（B-4 密钥永不打印测试）。
 - 执行器：仅白名单 `numeric_batch_v1`，无 eval/exec/subprocess/动态导入。
 

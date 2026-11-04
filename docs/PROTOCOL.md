@@ -56,9 +56,11 @@ signature = Ed25519(sender_private_key, canonical)      # 128 hex
 4. 信封形状/类型/`v` 合法（`MALFORMED_ENVELOPE`）；
 5. `sender` 必须等于传输层对端身份（TCP 在 HELLO 绑定后生效，libp2p 用 `muxed_conn.peer_id`；失败 → `BAD_SENDER`）；
 6. Ed25519 验签（失败 → `BAD_SIGNATURE`，**此前不解释 body**）；
-7. 每 sender 的序号窗 `(last_seen, last_seen+4096]`（越界 → `SEQ_OUT_OF_WINDOW`，窗口持久化在 `node_state`）；
-8. 时间戳容差（`STALE_TIMESTAMP`）；
-9. 封闭注册表里的 body 精确键 schema（多余/缺失键 → `INVALID_BODY`；未知类型 → `UNSUPPORTED_TYPE`）。
+7. **收件人绑定（D1）**：`recipient` 非空且不等于本机 `node_id` → `UNAUTHORIZED`；
+   `recipient=null` 保留广播语义；检查放在验签之后，避免成为未认证的探测面；
+8. 每 sender 的序号窗 `(last_seen, last_seen+4096]`（越界 → `SEQ_OUT_OF_WINDOW`，窗口持久化在 `node_state`）；
+9. 时间戳容差（`STALE_TIMESTAMP`）；
+10. 封闭注册表里的 body 精确键 schema（多余/缺失键 → `INVALID_BODY`；未知类型 → `UNSUPPORTED_TYPE`）。
 
 > 顺序的意义：任何"解释 body"的动作（含 schema 校验）都发生在验签之后，
 > 未知/伪造消息不会进入业务解析路径。
@@ -207,3 +209,22 @@ worker 每轮先 `LEDGER_SYNC_REQUEST{after_seq}` → 协调者回一页
 Phase 1 的 11 条本地命令使用 `LocalLoopbackTransport`（进程内队列）与 HMAC
 （`ledger.key`，域 `idle-compute-result-v1` / `credit-v1`）。该路径**未改动**、语义不变；
 v2 网络路径与它在签名域、`sig_algo` 标记、传输实现上完全分离，互不降级。
+
+## 12. D1 扩展（协议已冻结，线上消息尚未注册）
+
+D1 新增了三份独立协议文档，代码在 `capability.py` / `requirement.py` / `lease.py`，
+**均未加入 16 种消息的封闭注册表**：
+
+| 对象 | 文档 | 代码 | 状态 |
+| --- | --- | --- | --- |
+| `CapabilityManifest` / `CapabilityAnnouncement` / `CapabilityRevocation` | `CAPABILITY-PROTOCOL.md` | `idle_compute/capability.py` | 模型/签名/版本/撤销已实现并测试；注册表（D5）与 P2P 传播（D2）未实现 |
+| `TaskRequirement` | `TASK-REQUIREMENT-PROTOCOL.md` | `idle_compute/requirement.py` | 校验已实现并测试；匹配器（D3）未实现 |
+| `TaskLeaseTerms`（双方签名） | `TASK-LEASE-PROTOCOL.md` | `idle_compute/lease.py` | 双签/校验已实现并测试；协商消息与持久化（D4）未实现 |
+
+新增的域字符串：`idle-compute-capability-v1`、`idle-compute-announcement-v1`、
+`idle-compute-capability-revoke-v1`、`idle-compute-lease-v1`、`idle-compute-lease-accept-v1`。
+它们与信封/结果/记账域互不复用。
+
+**D2/D4 添加线上消息时必须**：更新 `MessageType`、`_BODY_KEYS`、`_check_*` schema、
+角色分发集合（`_COORD_HANDLED` / `_WORKER_REPLY_TYPES` / `_CLIENT_REPLY_TYPES`）以及
+`test_protocol.py` 中"类型数量"的断言；不得走"给现有消息加字段"的路径（精确键集 + `v==1` 会直接拒绝）。

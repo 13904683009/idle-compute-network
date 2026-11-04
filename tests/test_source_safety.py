@@ -80,9 +80,13 @@ class SourceSafetyTests(unittest.TestCase):
         self.assertEqual(findings, [], findings)
 
     def test_task_dispatch_goes_only_through_the_registry(self) -> None:
-        # The registry is defined once; no other module touches it.
+        # The registry IDENTIFIER lives only in tasks.py. Match it as a whole
+        # word so unrelated names such as MAX_TASK_TYPES or the
+        # "supported_task_types" wire key do not count as uses of the registry.
         mentions = {
-            path.name for path in PACKAGE.glob("*.py") if "TASK_TYPES" in path.read_text(encoding="utf-8")
+            path.name
+            for path in PACKAGE.glob("*.py")
+            if re.search(r"\bTASK_TYPES\b", path.read_text(encoding="utf-8"))
         }
         self.assertEqual(mentions, {"tasks.py"}, "TASK_TYPES must live in tasks.py only")
 

@@ -432,6 +432,7 @@ class Node:
                     transport_peer_id=transport_peer if is_valid_node_id(transport_peer) else None,
                     verifier=NodeIdentity.verify_signature,
                     seq_window=self._seq_window,
+                    local_node_id=self.identity.node_id,
                 )
             except ProtocolError as exc:
                 self._on_parse_error(exc, frame, write)

@@ -215,7 +215,7 @@ class ManualPeer:
         self.coord_id = coord_id
         self.transport.dial(coord_id, [addr])
 
-    def craft(self, type_, body, in_reply_to=None, signer=None, seq=None) -> bytes:
+    def craft(self, type_, body, in_reply_to=None, signer=None, seq=None, recipient=None) -> bytes:
         signer = signer or self.identity
         if seq is None:
             self._seq += 1
@@ -225,7 +225,7 @@ class ManualPeer:
                 type_,
                 signer.node_id,
                 signer.sign,
-                recipient=self.coord_id,
+                recipient=recipient if recipient is not None else self.coord_id,
                 seq=seq,
                 body=body,
                 in_reply_to=in_reply_to,
@@ -235,8 +235,12 @@ class ManualPeer:
     def send(self, data: bytes) -> None:
         self.transport.send(self.coord_id, data)
 
-    def send_craft(self, type_, body, in_reply_to=None, signer=None) -> None:
-        self.send(self.craft(type_, body, in_reply_to=in_reply_to, signer=signer))
+    def send_craft(self, type_, body, in_reply_to=None, signer=None, recipient=None) -> None:
+        self.send(
+            self.craft(
+                type_, body, in_reply_to=in_reply_to, signer=signer, recipient=recipient
+            )
+        )
 
     def hello(self) -> None:
         self.send_craft(
@@ -981,6 +985,40 @@ class AdversarialWireTests(InProcessCoordinatorMixin, NodeTestsBase):
         # Whether or not a reply arrived, the wire must never emit an
         # ERROR that violates its own schema.
         self.assertEqual(len(peer._errors), errors_before, "reply must be schema-valid")
+
+    def test_message_for_another_recipient_is_not_processed(self) -> None:
+        """D1: a signature-valid PING addressed to a third node is refused.
+
+        The envelope signature is valid and the sender is allowlisted, so only
+        the recipient check can stop it. Observable: ERROR(UNAUTHORIZED) and
+        no PONG.
+        """
+        base = self.tmp("recipient-case")
+        coord_tmp = base / "coord"
+        coord_tmp.mkdir(exist_ok=True)
+        peer_tmp = base / "peer"
+        peer_tmp.mkdir(exist_ok=True)
+        other_tmp = base / "other"
+        other_tmp.mkdir(exist_ok=True)
+        peer_identity = _identity(peer_tmp, "peer")
+        other_identity = _identity(other_tmp, "other")
+        self.assertNotEqual(peer_identity.node_id, other_identity.node_id)
+        node, addr = self.start_coordinator(coord_tmp, [peer_identity.node_id])
+        self.addCleanup(node.shutdown)
+
+        peer = ManualPeer(peer_identity)
+        self.addCleanup(peer.stop)
+        peer.connect(node.identity.node_id, addr)
+        peer.hello()
+        self.assertIsNotNone(peer.wait_for(lambda e: e.type is MessageType.HELLO_ACK, 10.0))
+
+        peer.send_craft(MessageType.PING, {"nonce": "wrong-target"}, recipient=other_identity.node_id)
+        error = peer.expect_error(ErrorCode.UNAUTHORIZED, 10.0)
+        self.assertIsNotNone(error, "a message for another node must be refused")
+        self.assertIsNone(
+            peer.wait_for(lambda e: e.type is MessageType.PONG, 1.0),
+            "a misaddressed PING must never be processed",
+        )
 
 
 class ResilienceTests(NodeTestsBase):

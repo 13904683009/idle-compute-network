@@ -720,14 +720,21 @@ def parse_message(
     verifier: Callable[[str, str, str], bool],
     seq_window: SeqWindow,
     now: datetime | None = None,
+    local_node_id: str | None = None,
 ) -> Envelope:
     """Parse and validate one frame; raises ProtocolError on rejection.
 
     Order (tested to be observable): parse -> shape -> BAD_SENDER ->
-    signature -> seq window -> timestamp -> body schema. The verifier and
-    the body schema run in exactly that order, so a message with both a bad
-    signature and an invalid body is rejected as BAD_SIGNATURE and the body
-    is never schema-validated.
+    signature -> recipient -> seq window -> timestamp -> body schema. The
+    verifier and the body schema run in exactly that order, so a message with
+    both a bad signature and an invalid body is rejected as BAD_SIGNATURE and
+    the body is never schema-validated.
+
+    ``local_node_id`` (D1) enables the recipient check: a signature-valid
+    message addressed to another node is rejected with UNAUTHORIZED instead of
+    being processed by the wrong node. ``recipient=None`` keeps the documented
+    broadcast semantics and is always accepted. Callers that pass None (tests,
+    manual peers) get the pre-D1 behaviour.
     """
     value = parse_json(data)
     if not isinstance(value, dict):
@@ -772,6 +779,15 @@ def parse_message(
     payload = signing_payload(PROTOCOL_VERSION, type_str, sender, recipient, seq, ts, in_reply_to, body)
     if not verifier(sender, payload, signature):
         raise ProtocolError(ErrorCode.BAD_SIGNATURE, "envelope signature invalid")
+
+    # D1: recipient binding. Only after the signature so an attacker cannot use
+    # this as an unauthenticated oracle, and only when the caller knows who it
+    # is (None = broadcast, always accepted).
+    if local_node_id is not None and recipient is not None and recipient != local_node_id:
+        raise ProtocolError(
+            ErrorCode.UNAUTHORIZED,
+            f"message recipient {recipient[:12]}... is not this node",
+        )
 
     seq_window.check_and_update(sender, seq)
     check_timestamp(ts, now=now)

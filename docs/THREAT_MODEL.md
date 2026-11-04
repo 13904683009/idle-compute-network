@@ -73,7 +73,8 @@
 | **超大帧 / 畸形帧** | 长度前缀先校验再分配；截断/非法 JSON → 关流，节点存活 | `test_protocol.py`（65537 字节帧）、`test_node.py`（超大帧/垃圾帧后仍服务） |
 | **工人镜像被本地篡改** | 启动时从 `seq 0` 全链重审（分页可续）；每事件验签 + `prev_hash` 链 + 内容比对；分歧 → CONFLICT 停 claim，不回卷 | `tests/test_ledger_conflict.py`（篡改链在坏事件处停住、内容不一致冲突、hmac 行冲突） |
 | **降级/混合签名方案**（hmac 行混入网络链） | 行级 `sig_algo` 标记；网络镜像只接受 `ed25519`，其余结构化 CONFLICT；网络协调者从空库起链 | `test_ledger.py::test_hmac_tagged_event_is_conflict`、`test_ledger_conflict.py` |
-| **网络窃听 / 中间人** | 应用层：信封 + 结果 + 记账三层 Ed25519 签名（端到端，不依赖链路）；传输层：**依赖 libp2p 默认 security transport，本项目未显式配置/验证** | 签名有测试；**不得声称链路已加密** |
+| **网络窃听 / 中间人** | 应用层：信封 + 结果 + 记账三层 Ed25519 签名（端到端，不依赖链路）。传输层（D1 起）：`Libp2pTransport` 显式只注册 **Noise + TLS**（`sec_opt`），不再提供 `/plaintext/2.0.0` 与 `/secio`；实际协商结果通过 `negotiated_security_protocol` 断言；仅提供明文的 peer 在握手阶段被拒（fail-closed） | `tests/test_security_negotiation.py`：注册表精确匹配、双方协商值 ∈ {`/noise`,`/tls/1.0.0`}、明文 peer 被拒。**仍不宣称应用层加密**：payload 明文落库/上线，链路加密只保护传输段 |
+| **收件人错投（D1 修复）** | 入站 `recipient` 非空且不等于本机 → `UNAUTHORIZED`（验签之后检查）；`recipient=null` 为广播 | `test_protocol.py::TestRecipientBinding`（5 项）、`test_node.py::test_message_for_another_recipient_is_not_processed` |
 | **未授权节点接入** | 静态 `node_id` 白名单，默认拒绝（对称：worker/client 也校验协调者）；未列名单 HELLO → `UNAUTHORIZED` 关流 | `test_node.py::test_unauthorized_hello_rejected`、配置期对称校验 |
 | **Windows 密钥 ACL 限制** | 创建时显式 RuntimeWarning；密钥不进日志/消息/版本库；机密性依赖目录 ACL | `test_identity.py`、`test_crypto.py`（ACL 警告）、`test_log.py`（三进程 DEBUG 捕获：无密钥字节/无 key 路径/无完整签名/无载荷值） |
 | **账本尾部删除** | 无外部锚点 → 检测不到合法前缀的尾删；工人镜像只能提供部分历史 | **剩余风险**，Phase 1 继承；`test_tail_deletion_is_not_detected_without_external_anchor` |

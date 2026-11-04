@@ -130,11 +130,24 @@ import threading
 import trio
 from libp2p import new_host
 from libp2p.crypto.keys import KeyPair
+from libp2p.crypto.x25519 import create_new_key_pair as create_new_x25519_key_pair
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo
+from libp2p.security.noise.transport import PROTOCOL_ID as NOISE_PROTOCOL_ID
+from libp2p.security.noise.transport import Transport as NoiseTransport
+from libp2p.security.tls.transport import PROTOCOL_ID as TLS_PROTOCOL_ID
+from libp2p.security.tls.transport import TLSTransport
 from multiaddr import Multiaddr
 
 logger = logging.getLogger(__name__)
+
+# D1: the ONLY security protocols this transport will negotiate. The libp2p
+# default registry also offers /secio and /plaintext/2.0.0; leaving them in
+# makes a plaintext downgrade possible (the responder picks from its own list
+# and the dialer falls back). Pinning Noise+TLS and nothing else makes a
+# plaintext-only peer fail the handshake instead of silently running in the
+# clear. tests/test_security_negotiation.py proves both directions.
+SECURITY_PROTOCOLS = ("/noise", "/tls/1.0.0")
 
 
 class Libp2pTransport(NetTransport):
@@ -182,6 +195,16 @@ class Libp2pTransport(NetTransport):
         self._start_error: BaseException | None = None
 
     # -- lifecycle ----------------------------------------------------------
+
+    def _security_options(self) -> dict[Any, Any]:
+        """Noise + TLS only. No secio, no plaintext (see SECURITY_PROTOCOLS)."""
+        return {
+            NOISE_PROTOCOL_ID: NoiseTransport(
+                self._key_pair,
+                noise_privkey=create_new_x25519_key_pair().private_key,
+            ),
+            TLS_PROTOCOL_ID: TLSTransport(self._key_pair),
+        }
 
     def start(self) -> None:
         """Bind listeners and accept inbound streams; second call is a no-op."""
@@ -257,11 +280,12 @@ class Libp2pTransport(NetTransport):
 
     async def _trio_main(
         self, ready_event: threading.Event, stop_event: threading.Event
-    ) -> None:
-        # The host is created on the trio thread so its trio primitives are
+    ) -> None:        # The host is created on the trio thread so its trio primitives are
         # born inside the loop that will use them.
         host = new_host(
-            key_pair=self._key_pair, listen_addrs=list(self._listen_multiaddrs)
+            key_pair=self._key_pair,
+            listen_addrs=list(self._listen_multiaddrs),
+            sec_opt=self._security_options(),
         )
         self._host = host
         # trio 0.30: from_thread calls from threads trio did not create
@@ -312,6 +336,32 @@ class Libp2pTransport(NetTransport):
         except BaseException:
             return []
         return [str(addr) for addr in addrs]
+
+    def negotiated_security_protocol(self, peer_id: str) -> str | None:
+        """The security protocol actually negotiated with ``peer_id`` (D1).
+
+        None means "no live connection / cannot read it". Tests assert this is
+        in :data:`SECURITY_PROTOCOLS` after a real handshake, so a plaintext
+        downgrade cannot pass unnoticed.
+        """
+        self._require_started()
+        try:
+            remote = ID.from_base58(peer_id)
+        except Exception:
+            return None
+
+        async def _read() -> str | None:
+            host = self._host
+            if host is None:
+                return None
+            for conn in host.get_network().connections.get(remote) or []:
+                muxed = getattr(conn, "muxed_conn", None)
+                value = getattr(muxed, "negotiated_security_protocol", None)
+                if value:
+                    return str(value)
+            return None
+
+        return self._from_thread(_read)
 
     # -- outbound -----------------------------------------------------------
 

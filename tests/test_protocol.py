@@ -92,7 +92,7 @@ def frame_for(type_, body, sign=FAKE.sign, ts=None, seq=1, recipient=None, sende
     return encode_envelope(env)
 
 
-def parse_frame(frame, transport_peer_id=SENDER, verifier=None, seq_window=None, now=None):
+def parse_frame(frame, transport_peer_id=SENDER, verifier=None, seq_window=None, now=None, local_node_id=None):
     _, read = make_reader(frame)
     return parse_message(
         read_frame(read),
@@ -100,6 +100,7 @@ def parse_frame(frame, transport_peer_id=SENDER, verifier=None, seq_window=None,
         verifier=verifier or FAKE.verifier,
         seq_window=seq_window or SeqWindow(),
         now=now,
+        local_node_id=local_node_id,
     )
 
 
@@ -319,6 +320,39 @@ class TestPipelineOrder(unittest.TestCase):
         with self.assertRaises(ProtocolError) as ctx:
             parse_frame(frame, now=datetime(2026, 10, 27, tzinfo=timezone.utc))
         self.assertEqual(ctx.exception.code, ErrorCode.STALE_TIMESTAMP)
+
+
+class TestRecipientBinding(unittest.TestCase):
+    """D1: a signature-valid message for ANOTHER node must not be processed."""
+
+    def test_message_for_another_node_is_rejected(self):
+        frame = frame_for(MessageType.PING, {"nonce": "n"}, recipient=OTHER)
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.UNAUTHORIZED)
+
+    def test_message_addressed_to_this_node_is_accepted(self):
+        frame = frame_for(MessageType.PING, {"nonce": "n"}, recipient=SENDER)
+        env = parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(env.recipient, SENDER)
+
+    def test_broadcast_recipient_is_accepted(self):
+        frame = frame_for(MessageType.PING, {"nonce": "n"}, recipient=None)
+        env = parse_frame(frame, local_node_id=SENDER)
+        self.assertIsNone(env.recipient, "recipient=null keeps broadcast semantics")
+
+    def test_signature_is_checked_before_recipient(self):
+        frame = frame_for(
+            MessageType.PING, {"nonce": "n"}, recipient=OTHER, sign=FakeSigner(b"wrong-key").sign
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            parse_frame(frame, local_node_id=SENDER)
+        self.assertEqual(ctx.exception.code, ErrorCode.BAD_SIGNATURE, "no unauthenticated recipient oracle")
+
+    def test_caller_without_local_id_keeps_old_behaviour(self):
+        frame = frame_for(MessageType.PING, {"nonce": "n"}, recipient=OTHER)
+        env = parse_frame(frame)  # local_node_id omitted
+        self.assertEqual(env.recipient, OTHER)
 
 
 class TestSeqWindow(unittest.TestCase):
