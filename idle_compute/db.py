@@ -993,3 +993,82 @@ class Store:
             (now, now),
         )
         return int(cursor.rowcount)
+
+    def create_negotiation_for_lease(
+        self,
+        *,
+        lease_id: str,
+        task_id: str,
+        requester_id: str,
+        worker_id: str,
+        authority_id: str,
+        terms_json: str,
+        terms_hash: str,
+        requester_signature: str,
+        expires_at: str,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """D4 node flow: attach a PROPOSED negotiation to an EXISTING lease.
+
+        ``claim_task`` already created the ACTIVE ``leases`` row (one_active_lease
+        arbiter); the negotiation only decides whether the worker is allowed to
+        EXECUTE it. Re-proposing the same lease is idempotent.
+        """
+        now = now or utc_now()
+        with self.transaction():
+            self._expire_locked(now)
+            lease = self.get_lease(lease_id)
+            if lease is None or lease.task_id != task_id or lease.peer_id != worker_id:
+                raise TaskUnavailable("lease does not bind this task/worker")
+            if lease.status is not LeaseStatus.ACTIVE:
+                raise LeaseExpired("lease is not active")
+            existing = self.get_negotiation(lease_id)
+            if existing is not None:
+                if existing["terms_hash"] != terms_hash:
+                    raise NegotiationConflict("lease was already proposed with other terms")
+                return existing
+            try:
+                self.conn.execute(
+                    "INSERT INTO lease_negotiations(lease_id,task_id,requester_id,worker_id,authority_id,"
+                    "terms_json,terms_hash,requester_signature,state,created_at,expires_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,'PROPOSED',?,?,?)",
+                    (
+                        lease_id,
+                        task_id,
+                        requester_id,
+                        worker_id,
+                        authority_id,
+                        terms_json,
+                        terms_hash,
+                        requester_signature,
+                        now,
+                        expires_at,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise NegotiationConflict("another open negotiation already exists for this task") from exc
+        return self.get_negotiation(lease_id)  # type: ignore[return-value]
+
+    def activate_negotiation(self, lease_id: str, now: str | None = None) -> dict[str, Any]:
+        """ACCEPTED -> ACTIVE for a lease that already exists (node flow)."""
+        now = now or utc_now()
+        with self.transaction():
+            self._expire_locked(now)
+            row = self.get_negotiation(lease_id)
+            if row is None:
+                raise TaskUnavailable("negotiation not found")
+            if row["state"] == "ACTIVE":
+                return row
+            if row["state"] != "ACCEPTED":
+                raise InvalidNegotiationState(f"cannot activate a {row['state']} negotiation")
+            if _is_expired(row["expires_at"], now):
+                raise LeaseExpired("negotiation expired before activation")
+            lease = self.get_lease(lease_id)
+            if lease is None or lease.status is not LeaseStatus.ACTIVE:
+                raise LeaseExpired("lease is not active")
+            self.conn.execute(
+                "UPDATE lease_negotiations SET state='ACTIVE', committed_at=?, updated_at=? WHERE lease_id=?",
+                (now, now, lease_id),
+            )
+        return self.get_negotiation(lease_id)  # type: ignore[return-value]

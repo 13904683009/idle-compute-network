@@ -48,6 +48,8 @@ import re
 import sqlite3
 import threading
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
@@ -55,7 +57,15 @@ from typing import Any, Callable
 from . import ledger
 from .capability import CapabilityError
 from .config import NodeConfig, ValidationError, is_valid_node_id
-from .db import DuplicateSubmission, LeaseExpired, Store, TaskUnavailable
+from .db import (
+    DuplicateSubmission,
+    InvalidNegotiationState,
+    LeaseExpired,
+    NegotiationConflict,
+    Store,
+    StoreError,
+    TaskUnavailable,
+)
 from .discovery import (
     ACCEPTED,
     AnnouncementCache,
@@ -64,6 +74,8 @@ from .discovery import (
     build_manifest,
 )
 from .identity import NodeIdentity
+from .crypto import canonical_json, content_hash
+from .lease import LeaseCommit, LeaseError, TaskLeaseTerms, authorization_from_commit, terms_hash
 from .log import install_redaction
 from .models import Lease, LeaseStatus, Task, TaskStatus, ValidationStatus, new_id, utc_now
 from .net_transport import (
@@ -86,7 +98,7 @@ from .protocol import (
 )
 from .ratelimit import PeerRateLimiter
 from .signing import Ed25519Policy
-from .tasks import InvalidTaskInput
+from .tasks import InvalidTaskInput, get_task_type
 from .transport_tcp import TcpTransport
 from .worker import Worker
 
@@ -112,6 +124,8 @@ _COORD_HANDLED = frozenset(
         MessageType.SUBMIT_RESULT,
         MessageType.STATUS_REQUEST,
         MessageType.LEDGER_SYNC_REQUEST,
+        MessageType.LEASE_ACCEPT,
+        MessageType.LEASE_REJECT,
     }
 )
 _WORKER_REPLY_TYPES = frozenset(
@@ -123,6 +137,8 @@ _WORKER_REPLY_TYPES = frozenset(
         MessageType.CLAIM_DENIED,
         MessageType.RESULT_ACK,
         MessageType.LEDGER_SYNC_RESPONSE,
+        MessageType.LEASE_PROPOSE,
+        MessageType.LEASE_COMMIT,
     }
 )
 _CLIENT_REPLY_TYPES = frozenset(
@@ -284,6 +300,8 @@ class Node:
         self._discovery_lock = threading.Lock()
         self._publish_sequence = 0
         self._last_publish_at = 0.0
+        # D4: leases the coordinator cancelled while this worker was negotiating.
+        self._cancelled_leases: set[str] = set()
 
     # ------------------------------------------------------------------ seq
 
@@ -719,6 +737,12 @@ class Node:
             MessageType.CAPABILITY_RESPONSE,
         ):
             return self._handle_discovery(env, write)
+        if env.type is MessageType.LEASE_CANCEL:
+            # A cancelled lease must never be executed by this worker, even if
+            # the commit already arrived.
+            self._cancelled_leases.add(env.body["lease_id"])
+            logger.info("lease %s cancelled by the coordinator", env.body["lease_id"])
+            return True
         if env.type is MessageType.PING:
             self._reply(
                 write,
@@ -779,6 +803,10 @@ class Node:
                 self._handle_status_request(env, write)
             elif env.type is MessageType.LEDGER_SYNC_REQUEST:
                 self._handle_ledger_sync_request(env, write)
+            elif env.type is MessageType.LEASE_ACCEPT:
+                self._handle_lease_accept(env, write)
+            elif env.type is MessageType.LEASE_REJECT:
+                self._handle_lease_reject(env, write)
         except Exception:
             logger.exception("coordinator handler failed for %s", env.type.value)
             self._reply_error(write, ErrorCode.INTERNAL, "internal error", env)
@@ -900,6 +928,129 @@ class Node:
             },
             env,
         )
+        # D4: CLAIM_GRANT stays as a compatibility notification; EXECUTION of
+        # this task requires the dual-signed lease negotiated below.
+        if self.config.lease.mode == "dual_signed":
+            try:
+                self._propose_lease(lease, task, env, write)
+            except (StoreError, ValueError) as exc:
+                logger.warning("lease proposal failed for %s: %s", lease.lease_id, exc)
+                self._reply_error(write, ErrorCode.REJECTED, "lease proposal failed", env)
+
+    # ------------------------------------------------------ D4 lease flow
+
+    def _propose_lease(
+        self, lease: Lease, task: Task, env: Any, write: Callable[[bytes], None]
+    ) -> None:
+        """Sign the terms for an already-claimed lease and send LEASE_PROPOSE."""
+        existing = self._store.get_negotiation(lease.lease_id)
+        if existing is not None:
+            terms = TaskLeaseTerms.from_dict(json.loads(existing["terms_json"]))
+        else:
+            now = int(time.time())
+            try:
+                expires = int(datetime.fromisoformat(lease.expires_at).timestamp())
+            except ValueError:
+                expires = now + 30
+            spec = content_hash({"task_type": task.task_type, "payload": task.payload})
+            terms = TaskLeaseTerms(
+                lease_id=lease.lease_id,
+                task_id=lease.task_id,
+                requester_node_id=self.identity.node_id,
+                worker_node_id=lease.peer_id,
+                task_spec_hash=spec,
+                input_manifest_hash="",
+                lease_version=1,
+                issued_at=now,
+                expires_at=expires,
+                execution_deadline=expires,
+                verification_policy={"mode": "RECOMPUTE", "required": False},
+                reward_policy={"amount": 1},
+            ).sign_proposal(self.identity)
+            self._store.create_negotiation_for_lease(
+                lease_id=lease.lease_id,
+                task_id=lease.task_id,
+                requester_id=self.identity.node_id,
+                worker_id=lease.peer_id,
+                authority_id=self.identity.node_id,
+                terms_json=canonical_json(terms.to_dict()),
+                terms_hash=terms_hash(terms),
+                requester_signature=terms.requester_signature,
+                expires_at=lease.expires_at,
+            )
+        self._reply(
+            write,
+            MessageType.LEASE_PROPOSE,
+            {
+                "lease_id": lease.lease_id,
+                "task_id": lease.task_id,
+                "terms": terms.to_dict(),
+                "task": {"task_type": task.task_type, "payload": task.payload},
+            },
+            env,
+        )
+
+    def _handle_lease_accept(self, env: Any, write: Callable[[bytes], None]) -> None:
+        body = env.body
+        lease_id = body["lease_id"]
+        row = self._store.get_negotiation(lease_id)
+        if row is None or row["worker_id"] != env.sender:
+            self._reply_error(write, ErrorCode.UNAUTHORIZED, "no such lease for this worker", env)
+            return
+        try:
+            terms = TaskLeaseTerms.from_dict(json.loads(row["terms_json"]))
+            acceptance = body["acceptance"]
+            if body["terms_hash"] != row["terms_hash"] or terms_hash(terms) != row["terms_hash"]:
+                raise LeaseError(LeaseError.SCHEMA, "terms hash mismatch")
+            accepted = replace(terms, worker_signature=acceptance.get("signature", ""))
+            accepted.verify_accept(int(time.time()))
+            self._store.accept_negotiation(
+                lease_id, env.sender, acceptance["signature"], canonical_json(acceptance)
+            )
+            self._store.activate_negotiation(lease_id)
+            commit = LeaseCommit(
+                lease_id=terms.lease_id,
+                task_id=terms.task_id,
+                requester_node_id=terms.requester_node_id,
+                worker_node_id=terms.worker_node_id,
+                terms_hash=row["terms_hash"],
+                committed_at=int(time.time()),
+                expires_at=terms.expires_at,
+            ).sign(self.identity)
+            self._reply(
+                write,
+                MessageType.LEASE_COMMIT,
+                {
+                    "lease_id": lease_id,
+                    "terms_hash": row["terms_hash"],
+                    "commit": commit.to_dict(),
+                },
+                env,
+            )
+        except (LeaseError, StoreError, ValueError, KeyError) as exc:
+            logger.warning("LEASE_ACCEPT rejected for %s: %s", lease_id, exc)
+            self._reply_error(write, ErrorCode.REJECTED, f"lease not activated: {exc}"[:200], env)
+
+    def _handle_lease_reject(self, env: Any, write: Callable[[bytes], None]) -> None:
+        lease_id = env.body["lease_id"]
+        try:
+            self._store.reject_negotiation(lease_id, env.body.get("reason") or "worker rejected")
+        except (StoreError, InvalidNegotiationState) as exc:
+            logger.info("LEASE_REJECT for %s could not be applied: %s", lease_id, exc)
+            return
+        logger.info("worker %s rejected lease %s", env.sender[:12], lease_id)
+
+    def cancel_lease(self, lease_id: str, reason: str = "cancelled") -> None:
+        """Coordinator-side cancellation; cancels the negotiation and notifies."""
+        row = self._store.get_negotiation(lease_id)
+        self._store.cancel_negotiation(lease_id, reason)
+        if row is not None:
+            try:
+                self._send_to(
+                    row["worker_id"], MessageType.LEASE_CANCEL, {"lease_id": lease_id, "reason": reason}
+                )
+            except TransportError as exc:
+                logger.debug("LEASE_CANCEL to %s failed: %s", row["worker_id"][:12], exc)
 
     def _handle_submit_result(self, env: Any, write: Callable[[bytes], None]) -> None:
         body = env.body
@@ -1353,6 +1504,9 @@ class Node:
             self._persist_seq()
 
     def _claim_cycle(self, coordinator: str) -> None:
+        if self.config.lease.mode == "dual_signed":
+            self._claim_cycle_dual(coordinator)
+            return
         claim_request_id = new_id("crq_")
         seq = self._send_to(
             coordinator,
@@ -1397,9 +1551,28 @@ class Node:
             status=LeaseStatus.ACTIVE,
             expires_at=lease_body["expires_at"],
         )
+        self._execute_and_submit(task, lease)
+
+    def _execute_and_submit(
+        self,
+        task: Task,
+        lease: Lease,
+        *,
+        authorization: Any = None,
+        require_dual_signed: bool = False,
+    ) -> None:
+        coordinator = self.config.coordinator_node_id
+        if coordinator is None:
+            logger.error("worker has no coordinator configured")
+            return
         try:
-            output, digest, signature = Worker(self.identity.node_id, self._policy).execute(task, lease)
-        except InvalidTaskInput as exc:
+            output, digest, signature = Worker(self.identity.node_id, self._policy).execute(
+                task,
+                lease,
+                authorization=authorization,
+                require_dual_signed=require_dual_signed,
+            )
+        except (InvalidTaskInput, LeaseError) as exc:
             logger.warning("refusing task %s: %s", task.task_id, exc)
             return
         seq = self._send_to(
@@ -1429,6 +1602,79 @@ class Node:
                 logger.error("VALID ack without credit event")
         else:
             logger.warning("result INVALID: %s", ack.body.get("reason"))
+
+    def _claim_cycle_dual(self, coordinator: str) -> None:
+        """D4: CLAIM_REQUEST -> LEASE_PROPOSE -> ACCEPT -> COMMIT -> execute."""
+        claim_request_id = new_id("crq_")
+        seq = self._send_to(
+            coordinator,
+            MessageType.CLAIM_REQUEST,
+            {"claim_request_id": claim_request_id, "task_id": None},
+        )
+        timeout = float(self.config.lease.proposal_timeout_seconds)
+        try:
+            env = self._await(lambda e: e.type is MessageType.LEASE_PROPOSE, timeout, seq)
+        except NodeTimeoutError:
+            return
+        try:
+            terms = TaskLeaseTerms.from_dict(env.body["terms"])
+            now = int(time.time())
+            terms.verify_for_worker(self.identity.node_id, now)
+            if terms.requester_node_id != coordinator:
+                logger.warning("lease proposal from a non-coordinator requester")
+                return
+            if terms.lease_id != env.body["lease_id"] or terms.task_id != env.body["task_id"]:
+                logger.warning("lease proposal binding mismatch")
+                return
+            task_body = env.body["task"]
+            get_task_type(task_body["task_type"])  # whitelist enforced before signing
+            accepted = terms.sign_accept(self.identity)
+            accept_seq = self._send_to(
+                coordinator,
+                MessageType.LEASE_ACCEPT,
+                {
+                    "lease_id": terms.lease_id,
+                    "terms_hash": terms_hash(terms),
+                    "acceptance": {**accepted.acceptance(), "signature": accepted.worker_signature},
+                },
+            )
+            commit_env = self._await(
+                lambda e: e.type is MessageType.LEASE_COMMIT and e.body["lease_id"] == terms.lease_id,
+                timeout,
+                accept_seq,
+            )
+            commit = LeaseCommit.from_dict(commit_env.body["commit"])
+            commit.verify(int(time.time()))
+            if (
+                commit.terms_hash != terms_hash(terms)
+                or commit.worker_node_id != self.identity.node_id
+                or commit.requester_node_id != coordinator
+                or commit.lease_id != terms.lease_id
+            ):
+                logger.warning("lease commit does not bind this worker/terms")
+                return
+        except (LeaseError, InvalidTaskInput, ValueError, KeyError) as exc:
+            logger.warning("lease negotiation rejected: %s", exc)
+            return
+        if terms.lease_id in self._cancelled_leases:
+            logger.warning("lease %s was cancelled before execution", terms.lease_id)
+            return
+        authorization = authorization_from_commit(commit, accepted, authority_node_id=coordinator)
+        task = Task(
+            task_id=terms.task_id,
+            task_type=task_body["task_type"],
+            payload=task_body["payload"],
+        )
+        lease = Lease(
+            lease_id=terms.lease_id,
+            task_id=terms.task_id,
+            peer_id=self.identity.node_id,
+            status=LeaseStatus.ACTIVE,
+            expires_at=datetime.fromtimestamp(terms.expires_at, timezone.utc).isoformat(),
+        )
+        self._execute_and_submit(
+            task, lease, authorization=authorization, require_dual_signed=True
+        )
 
     # --------------------------------------------------------- client ops
 

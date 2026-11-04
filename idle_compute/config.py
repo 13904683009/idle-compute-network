@@ -77,6 +77,7 @@ _DEFAULTS = {
     "directory": {},
     "capability": None,
     "discovery": {},
+    "lease": {},
     "coordinator_node_id": None,
     "coordinator_addr": None,
     "poll_interval_seconds": 5,
@@ -115,6 +116,17 @@ _DISCOVERY_KEYS = frozenset(
         "query_timeout_seconds",
     }
 )
+# D4: default is the SAFE mode. "legacy" is an explicit compatibility opt-in
+# for local tests only; it is never selected implicitly.
+LEASE_MODES = ("dual_signed", "legacy")
+_LEASE_KEYS = frozenset({"mode", "proposal_timeout_seconds"})
+
+
+@dataclass(frozen=True)
+class LeaseConfig:
+    mode: str = "dual_signed"
+    proposal_timeout_seconds: int = 15
+
 
 
 @dataclass(frozen=True)
@@ -266,6 +278,23 @@ def _parse_discovery(value: Any) -> DiscoveryConfig:
             "discovery.offline_after_seconds must be greater than announce_interval_seconds"
         )
     return config
+
+
+def _parse_lease(value: Any) -> LeaseConfig:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValidationError(f"lease must be an object, got {type(value).__name__}")
+    unknown = sorted(str(key) for key in value if key not in _LEASE_KEYS)
+    if unknown:
+        raise ValidationError(f"lease has unknown key(s): {', '.join(unknown)}")
+    mode = value.get("mode", "dual_signed")
+    if mode not in LEASE_MODES:
+        raise ValidationError(f"lease.mode must be one of {', '.join(LEASE_MODES)}, got {mode!r}")
+    timeout = value.get("proposal_timeout_seconds", 15)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 120:
+        raise ValidationError("lease.proposal_timeout_seconds must be an int in 1..120")
+    return LeaseConfig(mode=mode, proposal_timeout_seconds=timeout)
 
 
 def from_dict(raw: dict[str, Any]) -> NodeConfig:
@@ -451,6 +480,7 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
 
     capability = _parse_capability_template(raw.get("capability", _DEFAULTS["capability"]))
     discovery = _parse_discovery(raw.get("discovery", _DEFAULTS["discovery"]))
+    lease = _parse_lease(raw.get("lease", _DEFAULTS["lease"]))
 
     return NodeConfig(
         node_id=node_id,
@@ -465,6 +495,7 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
         directory=directory,
         capability=capability,
         discovery=discovery,
+        lease=lease,
         coordinator_node_id=coordinator_node_id,
         coordinator_addr=coordinator_addr,
         poll_interval_seconds=poll_interval_seconds,
@@ -517,6 +548,7 @@ class NodeConfig:
     directory: dict[str, PeerDirectoryEntry] = field(default_factory=dict)
     capability: dict[str, Any] | None = None
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    lease: LeaseConfig = field(default_factory=LeaseConfig)
     coordinator_node_id: str | None = None
     coordinator_addr: str | None = None
     poll_interval_seconds: int = 5
@@ -551,6 +583,10 @@ class NodeConfig:
                 "max_announcement_ttl_seconds": self.discovery.max_announcement_ttl_seconds,
                 "offline_after_seconds": self.discovery.offline_after_seconds,
                 "query_timeout_seconds": self.discovery.query_timeout_seconds,
+            },
+            "lease": {
+                "mode": self.lease.mode,
+                "proposal_timeout_seconds": self.lease.proposal_timeout_seconds,
             },
             "coordinator_node_id": self.coordinator_node_id,
             "coordinator_addr": self.coordinator_addr,

@@ -100,13 +100,76 @@ worker_signature = Ed25519(worker_key, worker_payload)
 
 ---
 
-## 6. 未实现（诚实边界）
+## 6. D4 已接线（节点级闭环）
 
-- **协商消息未接线**：`LEASE_PROPOSE / LEASE_ACCEPT / LEASE_REJECT` 尚未加入封闭消息注册表
-  （D4 添加，届时 `test_protocol` 的类型计数会更新）。
-- **持久化未实现**：`lease_negotiations` 表、`db.py` v3 附加迁移属 D4。
-- **奖励只是内部积分**：没有代币、提现或金融语义；`amount` 不得被解释为可交易价值。
-- **时钟**：时间来自本机；跨设备时钟偏差未验证（D6 双设备）。
+> 本节取代 §6 旧文（旧文说"协商消息未接线"，现已被 D4 实现推翻）。
+
+### 6.1 角色
+
+- **coordinator = requester + authority**（ADR-D0-2）：持有任务、签条款、裁决 ACTIVE、签 `LeaseCommit`。
+- **worker**：验证提议、签接受、验证 commit，只有拿到 `ExecutionAuthorization` 才执行。
+- **client/requester**：只提交任务，不直接签租约（MVP 中 coordinator 代行 requester）。
+
+### 6.2 线上顺序（默认 `lease.mode=dual_signed`）
+
+```
+worker → coord  CLAIM_REQUEST {claim_request_id, task_id:null}
+coord  → worker CLAIM_GRANT   （兼容通知，不构成执行授权）
+coord  → worker LEASE_PROPOSE {lease_id, task_id, terms, task}
+worker 校验：sender=coordinator、recipient=自己、terms.verify_for_worker、task 白名单、未过期
+worker → coord  LEASE_ACCEPT  {lease_id, terms_hash, acceptance{...,signature}}
+coord  校验：negotiation.worker==sender、terms_hash 一致、worker 签名绑定同一条款
+coord  事务：accept_negotiation → activate_negotiation（ACCEPTED→ACTIVE）
+coord  → worker LEASE_COMMIT  {lease_id, terms_hash, commit(signed)}
+worker 校验：commit.verify、terms_hash/worker/requester 绑定、未被 CANCEL
+worker 构造 authorization_from_commit → Worker.execute(require_dual_signed=True)
+worker → coord  SUBMIT_RESULT（原有流程：独立验证 → 记账）
+```
+
+`LEASE_REJECT {lease_id, reason}` 由 worker 发送（幂等，PROPOSED/ACCEPTED→REJECTED）；
+`LEASE_CANCEL {lease_id, reason}` 由 coordinator 发送（幂等，→CANCELLED；worker 记入
+`_cancelled_leases`，随后即使收到 commit 也不执行）。
+
+### 6.3 执行授权门（唯一入口）
+
+`idle_compute/worker.py::Worker.execute` 是唯一执行白名单任务的代码路径：
+
+- 传入 `authorization` 时调用 `lease.require_authorization(...)`：校验 task/worker 绑定、
+  `terms_hash`、有效期、`LeaseCommit` 签名（`commit.verify`）；
+- 双签模式下缺 commit / 缺双方签名 / 身份不符 / terms_hash 不符 / 过期 → `NOT_AUTHORIZED`；
+- 网络 handler、CLI 都没有第二条执行路径；`_execute_and_submit` 是唯一提交点。
+
+### 6.4 状态机
+
+| 迁移 | 触发 | 持久化 |
+| --- | --- | --- |
+| ∅ → PROPOSED | coordinator 发送提议 | 事务内 `create_negotiation_for_lease` |
+| PROPOSED → ACCEPTED | worker 接受（同签名幂等） | `accept_negotiation` |
+| ACCEPTED → ACTIVE | coordinator 激活 + 签 commit | `activate_negotiation` |
+| PROPOSED/ACCEPTED → REJECTED | worker 拒绝 | `reject_negotiation`（幂等） |
+| PROPOSED/ACCEPTED → CANCELLED | coordinator 取消 | `cancel_negotiation`（幂等） |
+| PROPOSED/ACCEPTED → EXPIRED | 过期 | `expire_negotiations` / 每次事务的 `_expire_locked` |
+| ACTIVE → （任务完成） | 结果验证通过，任务 COMPLETED | 现有结果/账本事务；谈判行保留 |
+
+非法迁移（如 REJECTED→ACTIVE）一律 `InvalidNegotiationState`，不静默修复。
+
+### 6.5 权威含义与恢复
+
+- `LeaseCommit` 由 coordinator 身份签名（域 `idle-compute-lease-commit-v1`），绑定
+  `lease_id/task_id/双方/terms_hash/committed_at/expires_at`；worker 只信签名，不信"对方说 ACTIVE"。
+- 重启后：PROPOSED/ACCEPTED **不会**自动升 ACTIVE；ACTIVE 需重新验证 commit；
+  worker 没有本地持久化租约，重启后只会重新 claim；未 commit 的租约不会执行。
+- 持久化失败：`create_negotiation_for_lease`/`accept_negotiation`/`activate_negotiation`
+  抛错 → coordinator 回 `ERROR`，不发送 `LEASE_COMMIT`。
+- 过期清理保留 `lease_negotiations` 行（状态 EXPIRED），不删除防重放/审计所需记录。
+
+### 6.6 尚未实现
+
+- 真实双设备（D6）未执行；时钟偏差、NAT、断线重连语义未验证。
+- 取消仅"阻止后续启动/禁止重试"：**不能中断已开始的计算**（不宣称可安全中断）。
+- 多 coordinator / 去中心化调度未实现；coordinator 仍是单点权威。
+- legacy 模式（显式 `lease.mode=legacy`）仍保留给本地兼容测试，**不是默认**，
+  且不会被默认生产配置启用；双签模式下它无法通过执行门。
 
 ---
 
