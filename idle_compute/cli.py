@@ -20,7 +20,7 @@ from .coordinator import Coordinator
 from .config import load_config
 from .db import DuplicateSubmission, DuplicateValidation, LeaseExpired, StoreError, TaskUnavailable
 from .identity import NodeIdentity, is_valid_node_id
-from .ledger import LedgerError
+from .ledger import LedgerError, ensure_ledger_copy, mirror_status
 from .node import Node, NodeError
 from .state_machine import InvalidTransition
 from .tasks import InvalidTaskInput
@@ -139,6 +139,40 @@ def cmd_node_ping(args: argparse.Namespace) -> int:
         return 0
     finally:
         node.shutdown()
+
+
+def cmd_worker_ledger_status(args: argparse.Namespace) -> int:
+    """Report this worker's local mirror and any latched divergence (E-2)."""
+    config = load_config(args.config)
+    if config.role != "worker":
+        raise NodeError(
+            f"worker ledger status needs a worker config, got role={config.role!r}"
+        )
+    db_path = Path(config.data_dir) / "ledger_copy.db"
+    if db_path.exists():
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            ensure_ledger_copy(conn)
+            mirror = mirror_status(conn)
+        finally:
+            conn.close()
+    else:
+        mirror = {"head": 0, "events": 0, "verified": 0, "conflict": None}
+    conflict = mirror["conflict"]
+    _print(
+        {
+            "coordinator_node_id": config.coordinator_node_id,
+            "mirror_head": mirror["head"],
+            "events": mirror["events"],
+            "verified": mirror["verified"],
+            "conflict": conflict,
+            # The worker skips claiming while a conflict is latched; reporting
+            # a boolean keeps scripts from re-deriving that rule.
+            "claim_blocked": conflict is not None,
+        }
+    )
+    return 0
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -348,6 +382,20 @@ def build_parser() -> argparse.ArgumentParser:
     node_ping = node_sub.add_parser("ping", help="PING/PONG the coordinator")
     node_ping.add_argument("--config", default="var/node/node.json", help="node config JSON path")
     node_ping.set_defaults(func=cmd_node_ping)
+
+    worker = sub.add_parser("worker", help="inspect this worker's local state (Phase E)")
+    worker_sub = worker.add_subparsers(dest="worker_command", required=True)
+    worker_ledger = worker_sub.add_parser("ledger", help="worker ledger mirror operations")
+    worker_ledger_sub = worker_ledger.add_subparsers(
+        dest="worker_ledger_command", required=True
+    )
+    worker_ledger_status = worker_ledger_sub.add_parser(
+        "status", help="report mirror head/verified counts and any latched conflict"
+    )
+    worker_ledger_status.add_argument(
+        "--config", default="var/node/node.json", help="node config JSON path"
+    )
+    worker_ledger_status.set_defaults(func=cmd_worker_ledger_status)
 
     return parser
 

@@ -252,6 +252,11 @@ class Node:
         # coordinator chain; the worker stops claiming until a sync round
         # passes cleanly (which only happens once the divergence is fixed).
         self._ledger_conflict: str | None = None
+        # E-2 startup re-audit cursor: 0 means "re-verify the whole chain from
+        # the beginning", None means "incremental only". Set per worker run in
+        # _worker_loop so an in-place edit of an already-mirrored event is not
+        # invisible to incremental pulls.
+        self._audit_cursor: int | None = None
 
     # ------------------------------------------------------------------ seq
 
@@ -901,6 +906,10 @@ class Node:
         )
         self._mirror.row_factory = sqlite3.Row
         ledger.ensure_ledger_copy(self._mirror)
+        # Every worker start re-verifies the mirrored chain from seq 0 before
+        # trusting it (resumable across rounds), so an in-place edit of an
+        # already-mirrored event is detected rather than skipped.
+        self._audit_cursor = 0
         coordinator = self.config.coordinator_node_id
         if not coordinator or not self.config.coordinator_addr:
             raise NodeError("worker requires coordinator_node_id and coordinator_addr")
@@ -945,6 +954,11 @@ class Node:
     def _sync_ledger(self, coordinator: str) -> None:
         """Pull LEDGER_SYNC pages until the mirror reaches the chain head.
 
+        The first round after a worker start begins at seq 0 (``_audit_cursor``):
+        every already-mirrored event is re-verified and compared with the
+        coordinator copy, so an in-place edit of an old event is a conflict
+        instead of an invisible change. Later rounds start at the mirror head.
+
         Every event is fully verified before it is appended
         (ledger.verify_and_append: shape -> scheme -> duplicate -> seq
         continuity -> prev_hash linkage -> hash -> signature -> amount).
@@ -952,7 +966,7 @@ class Node:
         (E-2 policy): the worker never skips a bad event, never overwrites
         a mirror row, and stops claiming while the chains diverge.
         """
-        after = self._mirror_head_seq()
+        after = self._audit_cursor if self._audit_cursor is not None else self._mirror_head_seq()
         for _ in range(MAX_SYNC_PAGES_PER_ROUND):
             seq = self._send_to(
                 coordinator,
@@ -976,27 +990,54 @@ class Node:
             for event in body["events"]:
                 ok, reason = ledger.verify_and_append(self._mirror, event, self._policy)
                 if not ok:
-                    self._ledger_conflict = reason
-                    logger.error(
-                        "ledger conflict: %s (worker stops claiming until it clears)", reason
-                    )
+                    self._latch_conflict(reason, event.get("seq"))
                     return
             if body["events"]:
                 after = int(body["events"][-1]["seq"])
+            if self._audit_cursor is not None:
+                # Startup re-audit in progress: persist the cursor so a round
+                # that hits MAX_SYNC_PAGES_PER_ROUND resumes where it stopped
+                # (the mirror head would skip the un-audited middle).
+                self._audit_cursor = after
+                if not body["more"]:
+                    self._audit_cursor = None
             if head < after:
                 # The coordinator chain is SHORTER than the mirror: the
                 # coordinator lost its ledger (or was replaced). Never
                 # silently truncate the mirror -- stop and wait for the
                 # operator to rebuild (E-2 policy).
-                self._ledger_conflict = f"coordinator head {head} < mirror head {after}"
-                logger.error("ledger conflict: %s", self._ledger_conflict)
+                self._latch_conflict(f"coordinator head {head} < mirror head {after}", head + 1)
                 return
             if not body["more"]:
                 break
-        # A clean round (no conflict latched) clears any earlier latch, so a
-        # divergence fixed upstream lets the worker resume claiming on its
-        # next cycle.
+        # A clean round clears any earlier latch (the persisted copy too), so a
+        # divergence fixed upstream lets the worker resume claiming next cycle.
+        self._clear_conflict()
+
+    def _latch_conflict(self, reason: str, seq: int | None = None) -> None:
+        """Record a ledger divergence (memory + mirror meta) and stop claiming.
+
+        The persisted copy is what ``worker ledger status`` reports and what
+        survives a restart. It is advisory only: every sync round re-verifies
+        the chain, so a stale record can never mask a real divergence.
+        """
+        self._ledger_conflict = str(reason)
+        try:
+            ledger.record_conflict(self._mirror, self._ledger_conflict, seq)
+        except Exception:
+            logger.exception("could not persist the ledger conflict state")
+        logger.error(
+            "ledger conflict (seq=%s): %s [worker stops claiming until it clears]",
+            seq,
+            self._ledger_conflict,
+        )
+
+    def _clear_conflict(self) -> None:
         self._ledger_conflict = None
+        try:
+            ledger.clear_conflict(self._mirror)
+        except Exception:
+            logger.exception("could not clear the persisted ledger conflict state")
 
     def _ensure_connected(self) -> None:
         if self._connected:

@@ -619,7 +619,11 @@ def _check_sync_event(value: Any) -> None:
         and _is_hex(value.get("prev_hash"), HASH_HEX_LENGTH)
         and _is_hex(value.get("event_hash"), HASH_HEX_LENGTH)
         and _is_hex(value.get("signature"), SIG_HEX_LENGTH)
-        and value.get("sig_algo") == "ed25519"
+        # sig_algo is deliberately NOT pinned to "ed25519" here: a downgraded
+        # row must reach ledger.verify_and_append, which raises a structured
+        # CONFLICT (and stops the mirror). Rejecting the whole page in the
+        # schema would turn a hostile row into an invisible sync timeout.
+        and _is_short_str(value.get("sig_algo"), 32)
         and isinstance(value.get("metadata_json"), str)
         and len(value["metadata_json"]) <= MAX_EVENT_METADATA
     ):

@@ -305,13 +305,86 @@ CREATE TABLE IF NOT EXISTS ledger_copy (
     event_json TEXT NOT NULL,
     verified INTEGER NOT NULL DEFAULT 0
 );
+
+-- Worker-side advisory state (E-2): the last divergence the mirror could not
+-- follow, so ``worker ledger status`` and a restarted worker can report it.
+-- This table is never part of the coordinator chain.
+CREATE TABLE IF NOT EXISTS ledger_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+CONFLICT_META_KEY = "ledger_conflict"
 
 
 def ensure_ledger_copy(conn: sqlite3.Connection) -> None:
-    """Create the worker-side ledger_copy mirror table if missing."""
+    """Create the worker-side mirror table (+advisory meta) if missing."""
     conn.executescript(LEDGER_COPY_SCHEMA)
     conn.commit()
+
+
+def mirror_meta_get(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM ledger_meta WHERE key=?", (key,)).fetchone()
+    return None if row is None else str(row[0])
+
+
+def mirror_meta_set(conn: sqlite3.Connection, key: str, value: str | None) -> None:
+    if value is None:
+        conn.execute("DELETE FROM ledger_meta WHERE key=?", (key,))
+    else:
+        conn.execute(
+            "INSERT INTO ledger_meta(key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+    conn.commit()
+
+
+def record_conflict(
+    conn: sqlite3.Connection, reason: str, seq: int | None = None, at: str | None = None
+) -> None:
+    """Persist the divergence that stopped the mirror (advisory, not authority)."""
+    payload = {
+        "reason": str(reason),
+        "seq": int(seq) if isinstance(seq, int) else None,
+        "at": at or utc_now(),
+    }
+    mirror_meta_set(
+        conn, CONFLICT_META_KEY, json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def clear_conflict(conn: sqlite3.Connection) -> None:
+    mirror_meta_set(conn, CONFLICT_META_KEY, None)
+
+
+def read_conflict(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    raw = mirror_meta_get(conn, CONFLICT_META_KEY)
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {"reason": raw, "seq": None, "at": None}
+    if not isinstance(payload, dict):
+        return {"reason": raw, "seq": None, "at": None}
+    return payload
+
+
+def mirror_status(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Read-only mirror summary for ``worker ledger status`` (E-2)."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) AS head, COUNT(*) AS events, "
+        "COALESCE(SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END), 0) AS verified "
+        "FROM ledger_copy"
+    ).fetchone()
+    return {
+        "head": int(row["head"]),
+        "events": int(row["events"]),
+        "verified": int(row["verified"]),
+        "conflict": read_conflict(conn),
+    }
 
 
 def verify_and_append(
@@ -343,12 +416,27 @@ def verify_and_append(
         )
     seq = int(event["seq"])
     existing = conn.execute(
-        "SELECT seq FROM ledger_copy WHERE event_id=?", (event_id,)
+        "SELECT seq, event_json FROM ledger_copy WHERE event_id=?", (event_id,)
     ).fetchone()
     if existing is not None:
-        if int(existing["seq"]) == seq:
-            return True, None  # idempotent re-append of the identical event
-        return False, f"event {event_id}: duplicate event_id/idempotency_key conflict"
+        if int(existing["seq"]) != seq:
+            return False, f"event {event_id}: duplicate event_id/idempotency_key conflict"
+        # A re-append of the SAME event is an idempotent no-op, but a row that
+        # carries the same id with different content means the mirror and the
+        # coordinator chain disagree (an in-place chain edit): that is a
+        # conflict, never a silent pass (E-2 re-audit path).
+        try:
+            stored = json.loads(existing["event_json"])
+        except (TypeError, json.JSONDecodeError):
+            return False, f"event {event_id}: stored mirror row is malformed"
+        stored_text = json.dumps(stored, ensure_ascii=False, sort_keys=True)
+        incoming_text = json.dumps(event, ensure_ascii=False, sort_keys=True)
+        if stored_text == incoming_text:
+            return True, None
+        return (
+            False,
+            f"event {event_id}: mirror content differs from the coordinator copy at seq {seq}",
+        )
     last = conn.execute("SELECT seq, event_json FROM ledger_copy ORDER BY seq DESC LIMIT 1").fetchone()
     if last is None:
         expected_seq = 1
