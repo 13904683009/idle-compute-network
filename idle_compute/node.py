@@ -89,6 +89,11 @@ SUBMIT_ACK_TIMEOUT = 30.0
 LEDGER_SYNC_TIMEOUT = 20.0
 MAX_SYNC_PAGES_PER_ROUND = 20  # bounded catch-up per worker cycle
 WORK_QUEUE_SIZE = 1024
+# F-2: hard cap on non-terminal tasks (QUEUED/LEASED/RUNNING/SUBMITTED). The
+# coordinator serves TASK_CREATE on its single loop thread, so a count-then-
+# insert check is race-free; the 1001st live task is refused with OVERLOAD.
+MAX_ACTIVE_TASKS = 1000
+_TERMINAL_TASK_STATUSES = ("COMPLETED", "REJECTED", "CANCELLED", "EXPIRED")
 REPLY_BUFFER_SIZE = 64
 
 _COORD_HANDLED = frozenset(
@@ -601,6 +606,16 @@ class Node:
         if row is not None:
             task_id = row[0]
         else:
+            # F-2: bounded task pool. Counted on the actor thread, so the
+            # check-then-insert cannot race with another create.
+            placeholders = ",".join("?" for _ in _TERMINAL_TASK_STATUSES)
+            live = self._store.conn.execute(
+                f"SELECT COUNT(*) FROM tasks WHERE status NOT IN ({placeholders})",
+                _TERMINAL_TASK_STATUSES,
+            ).fetchone()[0]
+            if int(live) >= MAX_ACTIVE_TASKS:
+                self._reply_error(write, ErrorCode.OVERLOAD, "task pool is full", env)
+                return
             try:
                 task = self._store.create_task(
                     env.body["task_type"],
