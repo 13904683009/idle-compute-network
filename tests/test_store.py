@@ -373,14 +373,14 @@ class SchemaV2MigrationTests(unittest.TestCase):
         conn.commit()
         conn.close()
 
-    def test_v1_database_migrates_in_place_to_schema_v2(self) -> None:
+    def test_v1_database_migrates_in_place_to_schema_v3(self) -> None:
         self._build_v1_db()
         store = Store(self.db, self.key)
         self.addCleanup(store.close)
         version = store.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()["value"]
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "3")
         for table in ("credit_events", "results"):
             columns = store.conn.execute(f"PRAGMA table_info({table})").fetchall()
             sig_algo = next((c for c in columns if c[1] == "sig_algo"), None)

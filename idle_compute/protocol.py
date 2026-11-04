@@ -64,6 +64,10 @@ MAX_EVENT_METADATA = 2048
 # inside MAX_BODY_BYTES, and one response can carry a bounded candidate list.
 MAX_CAPABILITY_OBJECT_BYTES = 24 * 1024
 MAX_DISCOVERY_PEERS = 32
+# D4 lease objects are small: terms + one task payload + signatures.
+MAX_LEASE_OBJECT_BYTES = 8 * 1024
+MAX_LEASE_ID = 64
+MAX_LEASE_REASON = 200
 
 _B58_ALPHABET = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 _NODE_ID_PREFIX = "12D3KooW"
@@ -124,13 +128,29 @@ class MessageType(str, Enum):
     CAPABILITY_ANNOUNCE = "CAPABILITY_ANNOUNCE"
     CAPABILITY_QUERY = "CAPABILITY_QUERY"
     CAPABILITY_RESPONSE = "CAPABILITY_RESPONSE"
+    # D4 dual-signed lease negotiation (see TASK-LEASE-PROTOCOL.md §D4)
+    LEASE_PROPOSE = "LEASE_PROPOSE"
+    LEASE_ACCEPT = "LEASE_ACCEPT"
+    LEASE_REJECT = "LEASE_REJECT"
+    LEASE_COMMIT = "LEASE_COMMIT"
+    LEASE_CANCEL = "LEASE_CANCEL"
 
 
-# D2 recipient policy: a broadcast may be sent with recipient=null; a directed
-# message must name exactly one recipient. Everything else keeps the pre-D2
-# rule (recipient optional, checked against the local node when known).
+# D2/D4 recipient policy: a broadcast may be sent with recipient=null; a
+# directed message must name exactly one recipient. Everything else keeps the
+# pre-D2 rule (recipient optional, checked against the local node when known).
 BROADCAST_TYPES = frozenset({MessageType.CAPABILITY_ANNOUNCE})
-DIRECTED_TYPES = frozenset({MessageType.CAPABILITY_QUERY, MessageType.CAPABILITY_RESPONSE})
+DIRECTED_TYPES = frozenset(
+    {
+        MessageType.CAPABILITY_QUERY,
+        MessageType.CAPABILITY_RESPONSE,
+        MessageType.LEASE_PROPOSE,
+        MessageType.LEASE_ACCEPT,
+        MessageType.LEASE_REJECT,
+        MessageType.LEASE_COMMIT,
+        MessageType.LEASE_CANCEL,
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +736,73 @@ def _check_capability_response(value: Any) -> None:
         _check_capability_objects(entry.get("announcement"), "announcement")
 
 
+def _check_lease_object(value: Any, label: str) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, f"{label} must be a JSON object")
+    if len(canonical_json(value)) > MAX_LEASE_OBJECT_BYTES:
+        raise ProtocolError(ErrorCode.INVALID_BODY, f"{label} is larger than {MAX_LEASE_OBJECT_BYTES} bytes")
+
+
+def _is_hex64(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _check_lease_id(value: Any) -> None:
+    if not (isinstance(value, str) and 0 < len(value) <= MAX_LEASE_ID):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "lease_id must be a short non-empty string")
+
+
+def _check_lease_propose(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_PROPOSE body must be an object")
+    _check_lease_id(value.get("lease_id"))
+    _check_lease_id(value.get("task_id"))
+    _check_lease_object(value.get("terms"), "terms")
+    task = value.get("task")
+    if not (isinstance(task, dict) and set(task) == {"task_type", "payload"}):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_PROPOSE task must have exactly task_type, payload")
+    if not isinstance(task["task_type"], str) or not isinstance(task["payload"], dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_PROPOSE task fields are invalid")
+    if len(canonical_json(task["payload"])) > MAX_BODY_BYTES // 2:
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_PROPOSE task payload is too large")
+
+
+def _check_lease_accept(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_ACCEPT body must be an object")
+    _check_lease_id(value.get("lease_id"))
+    if not _is_hex64(value.get("terms_hash")):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_ACCEPT terms_hash must be 64 hex chars")
+    _check_lease_object(value.get("acceptance"), "acceptance")
+
+
+def _check_lease_reject(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_REJECT body must be an object")
+    _check_lease_id(value.get("lease_id"))
+    reason = value.get("reason")
+    if not (reason is None or (isinstance(reason, str) and len(reason) <= MAX_LEASE_REASON)):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_REJECT reason must be null or a short string")
+
+
+def _check_lease_commit(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_COMMIT body must be an object")
+    _check_lease_id(value.get("lease_id"))
+    if not _is_hex64(value.get("terms_hash")):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_COMMIT terms_hash must be 64 hex chars")
+    _check_lease_object(value.get("commit"), "commit")
+
+
+def _check_lease_cancel(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_CANCEL body must be an object")
+    _check_lease_id(value.get("lease_id"))
+    reason = value.get("reason")
+    if not (reason is None or (isinstance(reason, str) and len(reason) <= MAX_LEASE_REASON)):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "LEASE_CANCEL reason must be null or a short string")
+
+
 BODY_SCHEMAS: dict[MessageType, Callable[[Any], None]] = {
     MessageType.HELLO: _check_hello,
     MessageType.HELLO_ACK: _check_hello_ack,
@@ -736,6 +823,11 @@ BODY_SCHEMAS: dict[MessageType, Callable[[Any], None]] = {
     MessageType.CAPABILITY_ANNOUNCE: _check_capability_announce,
     MessageType.CAPABILITY_QUERY: _check_capability_query,
     MessageType.CAPABILITY_RESPONSE: _check_capability_response,
+    MessageType.LEASE_PROPOSE: _check_lease_propose,
+    MessageType.LEASE_ACCEPT: _check_lease_accept,
+    MessageType.LEASE_REJECT: _check_lease_reject,
+    MessageType.LEASE_COMMIT: _check_lease_commit,
+    MessageType.LEASE_CANCEL: _check_lease_cancel,
 }
 
 
@@ -770,6 +862,11 @@ _BODY_KEYS: dict[MessageType, tuple[str, ...]] = {
     MessageType.CAPABILITY_ANNOUNCE: ("manifest", "announcement"),
     MessageType.CAPABILITY_QUERY: ("task_type", "runtime"),
     MessageType.CAPABILITY_RESPONSE: ("query_seq", "peers"),
+    MessageType.LEASE_PROPOSE: ("lease_id", "task_id", "terms", "task"),
+    MessageType.LEASE_ACCEPT: ("lease_id", "terms_hash", "acceptance"),
+    MessageType.LEASE_REJECT: ("lease_id", "reason"),
+    MessageType.LEASE_COMMIT: ("lease_id", "terms_hash", "commit"),
+    MessageType.LEASE_CANCEL: ("lease_id", "reason"),
 }
 
 

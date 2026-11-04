@@ -48,12 +48,20 @@ class DuplicateValidation(StoreError):
     """A validation for this result already exists."""
 
 
+class NegotiationConflict(StoreError):
+    """Another lease negotiation/active lease already exists for this task."""
+
+
+class InvalidNegotiationState(StoreError):
+    """The negotiation is not in a state that allows this transition."""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO meta(key,value) VALUES ('schema_version','2');
+INSERT OR IGNORE INTO meta(key,value) VALUES ('schema_version','3');
 
 CREATE TABLE IF NOT EXISTS peers (
     peer_id TEXT PRIMARY KEY,
@@ -95,6 +103,31 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_lease
     ON leases(task_id) WHERE status = 'active';
+
+-- D4: two-party lease negotiation. The DB lease row is only created when the
+-- coordinator COMMITs an ACCEPTED negotiation (ADR-D0-16); one open
+-- negotiation per task and one ACTIVE lease per task are enforced here.
+CREATE TABLE IF NOT EXISTS lease_negotiations (
+    lease_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    requester_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    authority_id TEXT NOT NULL,
+    terms_json TEXT NOT NULL,
+    terms_hash TEXT NOT NULL,
+    requester_signature TEXT NOT NULL,
+    worker_signature TEXT NOT NULL DEFAULT '',
+    acceptance_json TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    accepted_at TEXT,
+    committed_at TEXT,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_negotiation
+    ON lease_negotiations(task_id) WHERE state IN ('PROPOSED','ACCEPTED');
 
 CREATE TABLE IF NOT EXISTS results (
     result_id TEXT PRIMARY KEY,
@@ -191,7 +224,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE credit_events ADD COLUMN sig_algo TEXT NOT NULL DEFAULT 'hmac-sha256'"
         )
-    conn.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+    conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
 
 
 class Store:
@@ -451,6 +484,7 @@ class Store:
                     (target.value, now, row["task_id"]),
                 )
             count += 1
+        self._expire_negotiations_locked(now)
         return count
 
     def expire_leases(self, now: str | None = None) -> int:
@@ -767,3 +801,195 @@ class Store:
 
     def rebuild_ledger(self) -> dict[str, Any]:
         return ledger.rebuild_ledger(self.conn, self.signer)
+
+    # ------------------------------------------------ D4 lease negotiation
+
+    def create_negotiation(
+        self,
+        *,
+        lease_id: str,
+        task_id: str,
+        requester_id: str,
+        worker_id: str,
+        authority_id: str,
+        terms_json: str,
+        terms_hash: str,
+        requester_signature: str,
+        expires_at: str,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a PROPOSED negotiation; one open negotiation per task."""
+        now = now or utc_now()
+        with self.transaction():
+            self._expire_locked(now)
+            task = self.get_task(task_id)
+            if task is None or task.status is not TaskStatus.QUEUED:
+                raise TaskUnavailable("task is not available for a lease proposal")
+            try:
+                self.conn.execute(
+                    "INSERT INTO lease_negotiations(lease_id,task_id,requester_id,worker_id,authority_id,"
+                    "terms_json,terms_hash,requester_signature,state,created_at,expires_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,'PROPOSED',?,?,?)",
+                    (
+                        lease_id,
+                        task_id,
+                        requester_id,
+                        worker_id,
+                        authority_id,
+                        terms_json,
+                        terms_hash,
+                        requester_signature,
+                        now,
+                        expires_at,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise NegotiationConflict("an open negotiation already exists for this task") from exc
+        return self.get_negotiation(lease_id)  # type: ignore[return-value]
+
+    def get_negotiation(self, lease_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM lease_negotiations WHERE lease_id=?", (lease_id,)
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def open_negotiation_for_task(self, task_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM lease_negotiations WHERE task_id=? AND state IN ('PROPOSED','ACCEPTED')",
+            (task_id,),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def accept_negotiation(
+        self,
+        lease_id: str,
+        worker_id: str,
+        worker_signature: str,
+        acceptance_json: str,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """PROPOSED -> ACCEPTED. Idempotent for the same signature."""
+        now = now or utc_now()
+        with self.transaction():
+            self._expire_locked(now)
+            row = self.get_negotiation(lease_id)
+            if row is None:
+                raise TaskUnavailable("negotiation not found")
+            if row["worker_id"] != worker_id:
+                raise InvalidNegotiationState("lease is addressed to another worker")
+            if row["state"] == "ACCEPTED":
+                if row["worker_signature"] == worker_signature:
+                    return row
+                raise InvalidNegotiationState("lease was already accepted with another signature")
+            if row["state"] != "PROPOSED":
+                raise InvalidNegotiationState(f"cannot accept a {row['state']} negotiation")
+            self.conn.execute(
+                "UPDATE lease_negotiations SET state='ACCEPTED', worker_signature=?, acceptance_json=?, "
+                "accepted_at=?, updated_at=? WHERE lease_id=?",
+                (worker_signature, acceptance_json, now, now, lease_id),
+            )
+        return self.get_negotiation(lease_id)  # type: ignore[return-value]
+
+    def reject_negotiation(
+        self, lease_id: str, reason: str, now: str | None = None
+    ) -> dict[str, Any]:
+        """PROPOSED/ACCEPTED -> REJECTED. Idempotent."""
+        now = now or utc_now()
+        with self.transaction():
+            row = self.get_negotiation(lease_id)
+            if row is None:
+                raise TaskUnavailable("negotiation not found")
+            if row["state"] == "REJECTED":
+                return row
+            if row["state"] not in ("PROPOSED", "ACCEPTED"):
+                raise InvalidNegotiationState(f"cannot reject a {row['state']} negotiation")
+            self.conn.execute(
+                "UPDATE lease_negotiations SET state='REJECTED', reason=?, updated_at=? WHERE lease_id=?",
+                (reason, now, lease_id),
+            )
+        return self.get_negotiation(lease_id)  # type: ignore[return-value]
+
+    def cancel_negotiation(
+        self, lease_id: str, reason: str, now: str | None = None
+    ) -> dict[str, Any]:
+        """PROPOSED/ACCEPTED -> CANCELLED. Idempotent; ACTIVE is not cancellable here."""
+        now = now or utc_now()
+        with self.transaction():
+            row = self.get_negotiation(lease_id)
+            if row is None:
+                raise TaskUnavailable("negotiation not found")
+            if row["state"] == "CANCELLED":
+                return row
+            if row["state"] not in ("PROPOSED", "ACCEPTED"):
+                raise InvalidNegotiationState(f"cannot cancel a {row['state']} negotiation")
+            self.conn.execute(
+                "UPDATE lease_negotiations SET state='CANCELLED', reason=?, updated_at=? WHERE lease_id=?",
+                (reason, now, lease_id),
+            )
+        return self.get_negotiation(lease_id)  # type: ignore[return-value]
+
+    def commit_negotiation(
+        self, lease_id: str, now: str | None = None
+    ) -> tuple[Task, Lease]:
+        """ACCEPTED -> ACTIVE: create the DB lease the result flow validates.
+
+        Atomic: task QUEUED->LEASED, leases row, negotiation ACTIVE. Any
+        conflict (other active lease / reused lease id) aborts the transaction.
+        """
+        now = now or utc_now()
+        with self.transaction():
+            self._expire_locked(now)
+            row = self.get_negotiation(lease_id)
+            if row is None:
+                raise TaskUnavailable("negotiation not found")
+            if row["state"] == "ACTIVE":
+                lease = self.get_lease(lease_id)
+                task = self.get_task(row["task_id"])
+                if lease is not None and task is not None:
+                    return task, lease
+                raise InvalidNegotiationState("ACTIVE negotiation without its lease row")
+            if row["state"] != "ACCEPTED":
+                raise InvalidNegotiationState(f"cannot commit a {row['state']} negotiation")
+            if _is_expired(row["expires_at"], now):
+                raise LeaseExpired("negotiation expired before commit")
+            task = self.get_task(row["task_id"])
+            if task is None:
+                raise TaskUnavailable("task not found")
+            if task.status is not TaskStatus.QUEUED:
+                raise TaskUnavailable("task is no longer queued")
+            ensure_transition(TaskStatus.QUEUED, TaskStatus.LEASED)
+            self.conn.execute(
+                "INSERT OR IGNORE INTO peers(peer_id,display_name,created_at) VALUES (?,?,?)",
+                (row["worker_id"], "", utc_now()),
+            )
+            try:
+                self.conn.execute(
+                    "INSERT INTO leases(lease_id,task_id,peer_id,status,expires_at,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (lease_id, row["task_id"], row["worker_id"], LeaseStatus.ACTIVE.value, row["expires_at"], now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise NegotiationConflict("another active lease already exists for this task") from exc
+            self.conn.execute(
+                "UPDATE tasks SET status=?, attempts=attempts+1, updated_at=? WHERE task_id=?",
+                (TaskStatus.LEASED.value, now, row["task_id"]),
+            )
+            self.conn.execute(
+                "UPDATE lease_negotiations SET state='ACTIVE', committed_at=?, updated_at=? WHERE lease_id=?",
+                (now, now, lease_id),
+            )
+        return self.get_task(row["task_id"]), self.get_lease(lease_id)  # type: ignore[return-value]
+
+    def expire_negotiations(self, now: str | None = None) -> int:
+        now = now or utc_now()
+        with self.transaction():
+            return self._expire_negotiations_locked(now)
+
+    def _expire_negotiations_locked(self, now: str) -> int:
+        cursor = self.conn.execute(
+            "UPDATE lease_negotiations SET state='EXPIRED', updated_at=? "
+            "WHERE state IN ('PROPOSED','ACCEPTED') AND expires_at <= ?",
+            (now, now),
+        )
+        return int(cursor.rowcount)

@@ -181,6 +181,25 @@ def valid_body(type_: MessageType) -> dict:
         },
         MessageType.CAPABILITY_QUERY: {"task_type": None, "runtime": None},
         MessageType.CAPABILITY_RESPONSE: {"query_seq": 1, "peers": []},
+        # D4: shape-only samples; the lease layer does the crypto checks.
+        MessageType.LEASE_PROPOSE: {
+            "lease_id": "lea_1",
+            "task_id": "task-1",
+            "terms": {"lease_id": "lea_1"},
+            "task": {"task_type": "numeric_batch_v1", "payload": {"numbers": [1]}},
+        },
+        MessageType.LEASE_ACCEPT: {
+            "lease_id": "lea_1",
+            "terms_hash": "a" * 64,
+            "acceptance": {"lease_id": "lea_1"},
+        },
+        MessageType.LEASE_REJECT: {"lease_id": "lea_1", "reason": "busy"},
+        MessageType.LEASE_COMMIT: {
+            "lease_id": "lea_1",
+            "terms_hash": "a" * 64,
+            "commit": {"lease_id": "lea_1"},
+        },
+        MessageType.LEASE_CANCEL: {"lease_id": "lea_1", "reason": "cancelled"},
     }
     return samples[type_]
 
@@ -464,9 +483,9 @@ class TestTimestamp(unittest.TestCase):
 
 
 class TestBodyRegistry(unittest.TestCase):
-    def test_all_19_types_have_schemas_and_accept_valid_bodies(self):
-        self.assertEqual(len(BODY_SCHEMAS), 19)
-        self.assertEqual(len(MessageType), 19)
+    def test_all_24_types_have_schemas_and_accept_valid_bodies(self):
+        self.assertEqual(len(BODY_SCHEMAS), 24)
+        self.assertEqual(len(MessageType), 24)
         for type_ in MessageType:
             validate_body(type_, valid_body(type_))  # must not raise
 

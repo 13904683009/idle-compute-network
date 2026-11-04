@@ -20,12 +20,13 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any
 
-from .crypto import canonical_json
+from .crypto import canonical_json, content_hash
 from .identity import NodeIdentity, is_valid_node_id
 
 SCHEMA_VERSION = 1
 LEASE_DOMAIN = "idle-compute-lease-v1"
 ACCEPT_DOMAIN = "idle-compute-lease-accept-v1"
+COMMIT_DOMAIN = "idle-compute-lease-commit-v1"
 MAX_HASH = 64
 MAX_POLICY = 1024
 _HEX64_PATTERN = r"[0-9a-f]{64}"
@@ -54,6 +55,8 @@ class LeaseError(Exception):
     EXPIRED = "EXPIRED"
     WRONG_WORKER = "WRONG_WORKER"
     NOT_ACCEPTED = "NOT_ACCEPTED"
+    NOT_AUTHORIZED = "NOT_AUTHORIZED"
+    TASK_MISMATCH = "TASK_MISMATCH"
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
@@ -265,3 +268,165 @@ def _validate_terms(terms: TaskLeaseTerms) -> None:
         "reward_policy.amount must be an int",
     )
     _require(reward.get("amount", 1) >= 1, "reward_policy.amount must be >= 1")
+
+
+# ---------------------------------------------------------------------------
+# D4: coordinator commit + worker execution authorization
+
+
+def terms_hash(terms: TaskLeaseTerms) -> str:
+    """Stable digest of the requester-signed terms (binds accept/commit)."""
+    return content_hash(terms.terms())
+
+
+_COMMIT_KEYS = (
+    "schema_version",
+    "lease_id",
+    "task_id",
+    "requester_node_id",
+    "worker_node_id",
+    "terms_hash",
+    "committed_at",
+    "expires_at",
+)
+_SIGNED_COMMIT_KEYS = _COMMIT_KEYS + ("signature",)
+
+
+@dataclass(frozen=True)
+class LeaseCommit:
+    """Coordinator's authoritative "this lease is ACTIVE" confirmation.
+
+    Signed by the authority (in the MVP: the coordinator, ADR-D0-2) over a
+    payload that binds lease_id, task_id, both parties and the terms hash, so
+    a worker can only execute after it received a valid commit for exactly
+    these terms.
+    """
+
+    lease_id: str
+    task_id: str
+    requester_node_id: str
+    worker_node_id: str
+    terms_hash: str
+    committed_at: int
+    expires_at: int
+    schema_version: int = SCHEMA_VERSION
+    signature: str = ""
+
+    def payload(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in _COMMIT_KEYS}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.payload(), "signature": self.signature}
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "LeaseCommit":
+        data = _exact(value, _SIGNED_COMMIT_KEYS, "commit")
+        commit = cls(**{key: data[key] for key in _SIGNED_COMMIT_KEYS})
+        _validate_commit(commit)
+        return commit
+
+    def sign(self, authority: NodeIdentity) -> "LeaseCommit":
+        _validate_commit(self)
+        return replace(self, signature=authority.sign(_canonical(COMMIT_DOMAIN, self.payload())))
+
+    def verify(self, now: int | None = None) -> None:
+        _validate_commit(self)
+        _verify_signature(
+            self.requester_node_id, self.payload(), COMMIT_DOMAIN, self.signature, "commit"
+        )
+        if now is not None and self.expires_at <= now:
+            raise LeaseError(LeaseError.EXPIRED, "lease commit has expired")
+
+
+def _validate_commit(commit: LeaseCommit) -> None:
+    _require(commit.schema_version == SCHEMA_VERSION, "unsupported commit schema_version")
+    for label, value in (("lease_id", commit.lease_id), ("task_id", commit.task_id)):
+        _require(isinstance(value, str) and 1 <= len(value) <= 128, f"{label} must be 1..128 chars")
+    _require(is_valid_node_id(commit.requester_node_id), "requester_node_id is not a valid node id")
+    _require(is_valid_node_id(commit.worker_node_id), "worker_node_id is not a valid node id")
+    _require(bool(re.fullmatch(_HEX64_PATTERN, commit.terms_hash)), "terms_hash must be 64 lowercase hex chars")
+    _require(_is_int(commit.committed_at) and commit.committed_at >= 0, "committed_at must be >= 0")
+    _require(_is_int(commit.expires_at), "expires_at must be an int")
+
+
+@dataclass(frozen=True)
+class ExecutionAuthorization:
+    """The token the execution entry requires (built only after verification)."""
+
+    lease_id: str
+    task_id: str
+    worker_node_id: str
+    requester_node_id: str
+    authority_node_id: str
+    terms_hash: str
+    expires_at: int
+    dual_signed: bool
+    commit: LeaseCommit | None = None
+
+
+def require_authorization(
+    authorization: ExecutionAuthorization | None,
+    *,
+    task_id: str,
+    worker_node_id: str,
+    now: int,
+    require_dual_signed: bool = False,
+) -> None:
+    """Worker-side execution gate (raise LeaseError unless everything holds)."""
+    if authorization is None:
+        raise LeaseError(LeaseError.NOT_AUTHORIZED, "task execution requires a lease authorization")
+    if not isinstance(authorization, ExecutionAuthorization):
+        raise LeaseError(LeaseError.NOT_AUTHORIZED, "authorization has the wrong type")
+    if authorization.task_id != task_id:
+        raise LeaseError(LeaseError.TASK_MISMATCH, "authorization is for another task")
+    if authorization.worker_node_id != worker_node_id:
+        raise LeaseError(LeaseError.WRONG_WORKER, "authorization is for another worker")
+    if authorization.expires_at <= now:
+        raise LeaseError(LeaseError.EXPIRED, "authorization has expired")
+    if not (isinstance(authorization.terms_hash, str) and len(authorization.terms_hash) == 64):
+        raise LeaseError(LeaseError.NOT_AUTHORIZED, "authorization has no terms hash")
+    if not authorization.dual_signed:
+        if require_dual_signed:
+            raise LeaseError(
+                LeaseError.NOT_AUTHORIZED,
+                "dual-signed lease mode requires a coordinator commit signature",
+            )
+        return
+    commit = authorization.commit
+    if commit is None:
+        raise LeaseError(LeaseError.NOT_AUTHORIZED, "dual-signed authorization needs a commit")
+    commit.verify(now)
+    if (
+        commit.lease_id != authorization.lease_id
+        or commit.task_id != authorization.task_id
+        or commit.worker_node_id != authorization.worker_node_id
+        or commit.requester_node_id != authorization.requester_node_id
+        or commit.terms_hash != authorization.terms_hash
+    ):
+        raise LeaseError(LeaseError.TASK_MISMATCH, "commit does not bind this authorization")
+    if authorization.authority_node_id != authorization.requester_node_id:
+        # MVP: the coordinator IS the requester (ADR-D0-2).
+        raise LeaseError(LeaseError.NOT_AUTHORIZED, "authority/requester mismatch in the MVP")
+
+
+def authorization_from_commit(
+    commit: LeaseCommit, terms: TaskLeaseTerms, *, authority_node_id: str
+) -> ExecutionAuthorization:
+    """Build an authorization only from a commit that matches the terms."""
+    if commit.lease_id != terms.lease_id or commit.task_id != terms.task_id:
+        raise LeaseError(LeaseError.TASK_MISMATCH, "commit does not match the terms")
+    if commit.terms_hash != terms_hash(terms):
+        raise LeaseError(LeaseError.SCHEMA, "commit terms_hash does not match the terms")
+    if commit.worker_node_id != terms.worker_node_id:
+        raise LeaseError(LeaseError.WRONG_WORKER, "commit is for another worker")
+    return ExecutionAuthorization(
+        lease_id=terms.lease_id,
+        task_id=terms.task_id,
+        worker_node_id=terms.worker_node_id,
+        requester_node_id=terms.requester_node_id,
+        authority_node_id=authority_node_id,
+        terms_hash=commit.terms_hash,
+        expires_at=min(commit.expires_at, terms.expires_at),
+        dual_signed=True,
+        commit=commit,
+    )
