@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -56,6 +57,49 @@ class SourceSafetyTests(unittest.TestCase):
             if "socket." in text:
                 findings.append(f"{path.name}: socket.")
         self.assertEqual(findings, [], findings)
+
+    def test_libp2p_imports_are_confined_to_two_modules(self) -> None:
+        # F-3: all reverse-engineered libp2p API usage stays in the two pinned
+        # modules; every other file only mentions the name in docstrings.
+        allowed = {"identity.py", "net_transport.py"}
+        findings = []
+        for path in PACKAGE.glob("*.py"):
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                if re.match(r"^(from|import)\s+libp2p\b", stripped) and path.name not in allowed:
+                    findings.append(f"{path.name}:{lineno}: {stripped}")
+        self.assertEqual(findings, [], findings)
+
+    def test_no_asyncio_anywhere_in_the_package(self) -> None:
+        # The eval proved the asyncio bridge crashes; the runtime is trio-native.
+        findings = [
+            path.name
+            for path in PACKAGE.glob("*.py")
+            if re.search(r"^\s*(import|from)\s+asyncio\b", path.read_text(encoding="utf-8"), re.M)
+        ]
+        self.assertEqual(findings, [], findings)
+
+    def test_task_dispatch_goes_only_through_the_registry(self) -> None:
+        # The registry is defined once; no other module touches it.
+        mentions = {
+            path.name for path in PACKAGE.glob("*.py") if "TASK_TYPES" in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(mentions, {"tasks.py"}, "TASK_TYPES must live in tasks.py only")
+
+        # The Phase-2 runtime must resolve executors through get_task_type();
+        # only the Phase-1 local orchestrator (coordinator.py) and the store's
+        # validation helper are allowed to name the concrete task class.
+        for name in ("worker.py", "node.py", "net_transport.py", "transport_tcp.py"):
+            text = (PACKAGE / name).read_text(encoding="utf-8")
+            self.assertNotIn(
+                "NumericBatchTask", text, f"{name} must resolve tasks through the registry"
+            )
+        for name in ("db.py", "worker.py"):
+            self.assertIn(
+                "get_task_type",
+                (PACKAGE / name).read_text(encoding="utf-8"),
+                f"{name} must resolve the executor through the registry",
+            )
 
 
 if __name__ == "__main__":
