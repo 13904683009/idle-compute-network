@@ -127,3 +127,15 @@
 | 回滚 / 冲突 / 幂等 / 撤销 | `test_lower_version_is_rollback_and_higher_is_accept` / `test_same_version_different_content_is_conflict` / `test_revoked_version_stays_revoked` |
 | 公告序号/过期/绑定 | `AnnouncementTests` 5 项 |
 | 撤销签名 | `RevocationTests` 3 项 |
+
+---
+
+## 8. D5 注册表（本地模拟，库级能力）
+
+- 实现：`idle_compute/registry.py`（`CapabilityRegistry` 接口 + `LocalRegistryAdapter`），
+  测试：`tests/test_registry.py`（20 项），设计说明：`D5-REGISTRY.md`。
+- **不是链上注册表，也不是共识系统**：独立 SQLite 文件、单写者、可配置最终性延迟；
+  只存 `manifest_hash` + 版本/有效期/撤销/状态，不存原始清单。
+- 复用 D1 的 `CapabilityManifest` / `CapabilityRevocation` 签名与版本语义；
+  不新增线上消息，不改变 D2 公告缓存、D3 匹配器、D4 双签租约/执行授权门。
+- 未接线到节点与匹配器；D6 集成前需要独立评审。
