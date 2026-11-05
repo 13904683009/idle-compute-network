@@ -7,6 +7,7 @@
 - 执行授权：worker 必须持有协调者签名的 `LEASE_COMMIT` 才执行（默认 `dual_signed`）。
 - 任务类型：仅 `numeric_batch_v1`（`{"numbers": [int...]}`），**没有** Shell / eval / 插件。
 - 奖励：仅内部积分（CREDIT），**没有**代币、钱包、真实支付或链上交易。
+- 算力兑换：创建任务时可按 `credits.task_cost` 从 requester 的可用 CREDIT 中冻结/扣费（默认 0=免费）；失败/取消/过期退回，成功消费。详见 [CREDIT-EXCHANGE.md](CREDIT-EXCHANGE.md)。
 
 ## 当前状态（诚实声明）
 
@@ -109,6 +110,10 @@ python -m idle_compute node status --config var/quick/client/node.json --task-id
 见 **[TEAM-SIMULATION-GUIDE.md](TEAM-SIMULATION-GUIDE.md)**：局域网地址、防火墙、启动顺序、
 证据采集表、PASS/FAIL 判据、清理与常见故障。**当前尚未在两台真实设备上执行**，
 指南中的跨设备结果必须由团队实测填写，不能引用 loopback 结果。
+
+## CREDIT 兑换算力
+
+`credits.task_cost`（默认 0）> 0 时，`TASK_CREATE` 会先检查 requester 的可用余额，不足返回 `INSUFFICIENT_CREDIT`（wire code 17）；任务创建与冻结在同一事务内，成功 `SPENT`、失败/取消/过期 `REFUNDED`。语义与限制见 [CREDIT-EXCHANGE.md](CREDIT-EXCHANGE.md)。
 
 ## 测试
 

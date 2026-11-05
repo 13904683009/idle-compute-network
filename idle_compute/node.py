@@ -59,6 +59,7 @@ from .capability import CapabilityError, CapabilityManifest, CapabilityRevocatio
 from .config import NodeConfig, ValidationError, is_valid_node_id
 from .db import (
     DuplicateSubmission,
+    InsufficientCredit,
     InvalidNegotiationState,
     LeaseExpired,
     NegotiationConflict,
@@ -933,12 +934,22 @@ class Node:
                 self._reply_error(write, ErrorCode.OVERLOAD, "task pool is full", env)
                 return
             try:
-                task = self._store.create_task(
+                task = self._store.create_task_paid(
                     env.body["task_type"],
                     env.body["payload"],
+                    requester_id=env.sender,
+                    cost=self.config.credits.task_cost,
                     max_attempts=env.body["max_attempts"],
                     lease_seconds=env.body["lease_seconds"],
                 )
+            except InsufficientCredit as exc:
+                self._reply_error(
+                    write,
+                    ErrorCode.INSUFFICIENT_CREDIT,
+                    f"INSUFFICIENT_CREDIT: cost={exc.cost} available={exc.available}",
+                    env,
+                )
+                return
             except (ValueError, InvalidTaskInput) as exc:
                 self._reply_error(write, ErrorCode.INVALID_BODY, str(exc)[:200], env)
                 return

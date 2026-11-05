@@ -76,7 +76,7 @@ _HEX = frozenset("0123456789abcdefABCDEF")
 
 
 class ErrorCode(Enum):
-    """The 16 structured wire error codes."""
+    """The 17 structured wire error codes."""
 
     UNAUTHORIZED = 1  # sender not on the allowlist
     BAD_SIGNATURE = 2  # envelope signature invalid
@@ -94,6 +94,7 @@ class ErrorCode(Enum):
     NOT_FOUND = 14  # unknown task/lease/result
     OVERLOAD = 15  # resource limits hit
     INTERNAL = 16  # unexpected internal failure
+    INSUFFICIENT_CREDIT = 17  # requester cannot pay the task price
 
 
 class ProtocolError(Exception):

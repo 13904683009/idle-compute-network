@@ -93,7 +93,7 @@ signature = Ed25519(sender_private_key, canonical)      # 128 hex
   必须指名收件人，否则 `INVALID_BODY`；收件人不是本机则 `UNAUTHORIZED`（验签之后判定）。
   详见 `docs/phase2/DISCOVERY-PROTOCOL.md`。
 
-## 5. 错误码（16）
+## 5. 错误码（17）
 
 | code | 名称 | 触发 |
 | --- | --- | --- |
@@ -113,6 +113,7 @@ signature = Ed25519(sender_private_key, canonical)      # 128 hex
 | 14 | `NOT_FOUND` | 未知 task/lease/result |
 | 15 | `OVERLOAD` | 资源上限（工作队列/任务数） |
 | 16 | `INTERNAL` | 未预期内部错误（不回内部细节） |
+| 17 | `INSUFFICIENT_CREDIT` | requester 可用 CREDIT 不足以支付任务价格 |
 
 ## 6. 关键流程
 

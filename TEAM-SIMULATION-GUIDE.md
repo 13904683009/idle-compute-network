@@ -19,6 +19,7 @@
   只留在各自设备本地。
 - 配置里只需要交换 **node_id**（公开的 Ed25519 peer id）和 coordinator 的私网地址。
 - 仅使用白名单任务 `numeric_batch_v1` 和测试数据（小整数列表）；不涉及真实资金、代币或链。
+  `credit_holds` 只在协调者本地记录任务价格；默认 `credits.task_cost=0`（免费），如需演示“积分换算力”，在 coordinator 配置中设置 `credits.task_cost>=1`（requester 需先有 CREDIT）。
 - 任何人要求"提供私钥/关闭防火墙/开放公网"都应拒绝并停止测试。
 
 ---

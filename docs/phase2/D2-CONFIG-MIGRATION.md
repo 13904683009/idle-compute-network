@@ -67,6 +67,7 @@
 | | `hardware` / `resource_limits` / `network` / `verification` | — | 与 `CAPABILITY-PROTOCOL.md` 一致 |
 | | `available_resources` | `{cpu_cores:0,ram_mb:0,gpu_memory_mb:0}` | 公告里的可用资源（自报） |
 | | `accepting_tasks` | `false` | 是否接受新任务（自报） |
+| `credits` | `task_cost` | 0 | 创建任务时向 requester 收取的 CREDIT（0=免费） |
 | `discovery` | `announce_interval_seconds` | 20 | 公告间隔 |
 | | `max_entries` | 1024 | 缓存条数上限 |
 | | `max_announcement_ttl_seconds` | 120 | 本地允许的最长公告有效期（钳制远端时间） |

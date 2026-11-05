@@ -56,6 +56,26 @@ class InvalidNegotiationState(StoreError):
     """The negotiation is not in a state that allows this transition."""
 
 
+class InsufficientCredit(StoreError):
+    """The requester cannot pay for a task (earned - held/spent is too low)."""
+
+    code = "INSUFFICIENT_CREDIT"
+
+    def __init__(self, requester_id: str, cost: int, available: int) -> None:
+        super().__init__(
+            f"insufficient credit for {requester_id}: cost {cost}, available {available}"
+        )
+        self.requester_id = requester_id
+        self.cost = cost
+        self.available = available
+
+
+# credit_holds states
+HOLD_HELD = "HELD"
+HOLD_SPENT = "SPENT"
+HOLD_REFUNDED = "REFUNDED"
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -128,6 +148,20 @@ CREATE TABLE IF NOT EXISTS lease_negotiations (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_negotiation
     ON lease_negotiations(task_id) WHERE state IN ('PROPOSED','ACCEPTED');
+
+-- CREDIT-for-compute: a task is paid from the requester's earned balance when
+-- it is created. The hold is part of the same transaction as the task row and
+-- is settled exactly once (SPENT on success, REFUNDED on failure/cancel/expiry).
+-- The ledger itself is untouched: "available" = earned - held/spent.
+CREATE TABLE IF NOT EXISTS credit_holds (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+    requester_id TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS credit_holds_requester ON credit_holds(requester_id);
 
 CREATE TABLE IF NOT EXISTS results (
     result_id TEXT PRIMARY KEY,
@@ -408,6 +442,17 @@ class Store:
         max_attempts: int = 3,
         lease_seconds: int = 30,
     ) -> Task:
+        with self.transaction():
+            task_id = self._insert_task_locked(task_type, payload, max_attempts, lease_seconds)
+        return self.get_task(task_id)  # type: ignore[return-value]
+
+    def _insert_task_locked(
+        self,
+        task_type: str,
+        payload: dict[str, Any],
+        max_attempts: int,
+        lease_seconds: int,
+    ) -> str:
         task_cls = get_task_type(task_type)
         task_cls.validate(payload)
         if max_attempts < 1 or max_attempts > 10:
@@ -417,29 +462,90 @@ class Store:
         task_id = new_id("tsk_")
         shard_id = new_id("shd_")
         now = utc_now()
+        self.conn.execute(
+            "INSERT INTO tasks "
+            "(task_id,task_type,payload_json,status,attempts,max_attempts,lease_seconds,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                task_type,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                TaskStatus.QUEUED.value,
+                0,
+                max_attempts,
+                lease_seconds,
+                now,
+                now,
+            ),
+        )
+        self.conn.execute(
+            "INSERT INTO task_shards(shard_id,task_id,shard_index,shard_count,payload_json,status) "
+            "VALUES (?,?,?,?,?,?)",
+            (shard_id, task_id, 0, 1, json.dumps(payload, ensure_ascii=False, sort_keys=True), "queued"),
+        )
+        return task_id
+
+    def available_credit(self, requester_id: str) -> int:
+        """Earned CREDIT minus HELD+SPENT holds (the ledger itself is untouched)."""
+        return self._available_locked(requester_id)
+
+    def _available_locked(self, requester_id: str) -> int:
+        # Sum the CREDIT rows directly: the balance check must not depend on a
+        # full ledger verification (a tampered chain is reported by the ledger
+        # commands, not by task creation).
+        earned_row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS earned FROM credit_events WHERE peer_id=?",
+            (requester_id,),
+        ).fetchone()
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS held FROM credit_holds "
+            "WHERE requester_id=? AND state IN (?,?)",
+            (requester_id, HOLD_HELD, HOLD_SPENT),
+        ).fetchone()
+        return int(earned_row["earned"]) - int(row["held"])
+
+    def get_credit_hold(self, task_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM credit_holds WHERE task_id=?", (task_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    def create_task_paid(
+        self,
+        task_type: str,
+        payload: dict[str, Any],
+        *,
+        requester_id: str,
+        cost: int,
+        max_attempts: int = 3,
+        lease_seconds: int = 30,
+    ) -> Task:
+        """Create a task and charge ``cost`` CREDIT in ONE transaction.
+
+        ``available = earned - HELD - SPENT``. On insufficient funds the
+        transaction rolls back before any task row/hold exists.
+        """
+        if isinstance(cost, bool) or not isinstance(cost, int) or cost < 0:
+            raise ValueError("cost must be an int >= 0")
         with self.transaction():
-            self.conn.execute(
-                "INSERT INTO tasks "
-                "(task_id,task_type,payload_json,status,attempts,max_attempts,lease_seconds,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    task_id,
-                    task_type,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    TaskStatus.QUEUED.value,
-                    0,
-                    max_attempts,
-                    lease_seconds,
-                    now,
-                    now,
-                ),
-            )
-            self.conn.execute(
-                "INSERT INTO task_shards(shard_id,task_id,shard_index,shard_count,payload_json,status) "
-                "VALUES (?,?,?,?,?,?)",
-                (shard_id, task_id, 0, 1, json.dumps(payload, ensure_ascii=False, sort_keys=True), "queued"),
-            )
+            available = self._available_locked(requester_id)
+            if cost > 0 and available < cost:
+                raise InsufficientCredit(requester_id, cost, available)
+            task_id = self._insert_task_locked(task_type, payload, max_attempts, lease_seconds)
+            if cost > 0:
+                now = utc_now()
+                self.conn.execute(
+                    "INSERT INTO credit_holds(task_id,requester_id,amount,state,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (task_id, requester_id, cost, HOLD_HELD, now, now),
+                )
         return self.get_task(task_id)  # type: ignore[return-value]
+
+    def _settle_hold_locked(self, task_id: str, state: str, now: str) -> int:
+        """HELD -> SPENT/REFUNDED exactly once (idempotent for already-settled)."""
+        cursor = self.conn.execute(
+            "UPDATE credit_holds SET state=?, updated_at=? WHERE task_id=? AND state=?",
+            (state, now, task_id, HOLD_HELD),
+        )
+        return int(cursor.rowcount)
 
     def _expire_locked(self, now: str) -> int:
         rows = self.conn.execute(
@@ -464,6 +570,7 @@ class Store:
                         "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
                         (TaskStatus.EXPIRED.value, now, row["task_id"]),
                     )
+                    self._settle_hold_locked(row["task_id"], HOLD_REFUNDED, now)
             elif row["task_status"] == TaskStatus.SUBMITTED.value:
                 # Result submitted but never validated (crash window). Reject
                 # the stale result and hand the task back for retry; otherwise
@@ -483,6 +590,8 @@ class Store:
                     "UPDATE tasks SET status=?, result_id=NULL, updated_at=? WHERE task_id=?",
                     (target.value, now, row["task_id"]),
                 )
+                if target is TaskStatus.EXPIRED:
+                    self._settle_hold_locked(row["task_id"], HOLD_REFUNDED, now)
             count += 1
         self._expire_negotiations_locked(now)
         # A negotiation can only authorize execution while its lease is still
@@ -528,6 +637,7 @@ class Store:
                     "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
                     (TaskStatus.EXPIRED.value, now, row["task_id"]),
                 )
+                self._settle_hold_locked(row["task_id"], HOLD_REFUNDED, now)
                 return None
             ensure_transition(TaskStatus(row["status"]), TaskStatus.LEASED)
             lease_id = new_id("lea_")
@@ -720,6 +830,7 @@ class Store:
                     "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
                     (TaskStatus.COMPLETED.value, now, task.task_id),
                 )
+                self._settle_hold_locked(task.task_id, HOLD_SPENT, now)
                 ledger.append_credit(self.conn, self.signer, result.peer_id, task.task_id, 1, {"result_id": result_id})
                 validation = Validation(
                     validation_id=new_id("val_"),
@@ -754,6 +865,7 @@ class Store:
                 "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
                 (TaskStatus.REJECTED.value, now, task.task_id),
             )
+            self._settle_hold_locked(task.task_id, HOLD_REFUNDED, now)
             validation = Validation(
                 validation_id=new_id("val_"),
                 result_id=result_id,
@@ -808,6 +920,7 @@ class Store:
                 "UPDATE tasks SET status=?, cancel_reason=?, updated_at=? WHERE task_id=?",
                 (TaskStatus.CANCELLED.value, reason, now, task_id),
             )
+            self._settle_hold_locked(task_id, HOLD_REFUNDED, now)
             return self.get_task(task_id)  # type: ignore[return-value]
 
     def balances(self) -> dict[str, int]:

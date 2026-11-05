@@ -576,9 +576,9 @@ class TestErrorEnvelope(unittest.TestCase):
         self.assertEqual(parsed.body["ref_type"], "HELLO")
         self.assertEqual(parsed.body["ref_seq"], 2)
 
-    def test_16_error_codes(self):
-        self.assertEqual(len(ErrorCode), 16)
-        self.assertEqual([c.value for c in ErrorCode], list(range(1, 17)))
+    def test_17_error_codes(self):
+        self.assertEqual(len(ErrorCode), 17)
+        self.assertEqual([c.value for c in ErrorCode], list(range(1, 18)))
 
 
 class TestGoldenVectors(unittest.TestCase):

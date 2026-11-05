@@ -77,6 +77,7 @@ _DEFAULTS = {
     "directory": {},
     "capability": None,
     "discovery": {},
+    "credits": {},
     "lease": {},
     "coordinator_node_id": None,
     "coordinator_addr": None,
@@ -127,6 +128,30 @@ _LEASE_KEYS = frozenset({"mode", "proposal_timeout_seconds"})
 class LeaseConfig:
     mode: str = "dual_signed"
     proposal_timeout_seconds: int = 15
+
+
+@dataclass(frozen=True)
+class CreditsConfig:
+    """CREDIT-for-compute price per task; 0 keeps the historic free path."""
+
+    task_cost: int = 0
+
+
+_CREDITS_KEYS = frozenset({"task_cost"})
+
+
+def _parse_credits(value: Any) -> CreditsConfig:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValidationError(f"credits must be an object, got {type(value).__name__}")
+    unknown = sorted(str(key) for key in value if key not in _CREDITS_KEYS)
+    if unknown:
+        raise ValidationError(f"credits has unknown key(s): {', '.join(unknown)}")
+    cost = value.get("task_cost", 0)
+    if isinstance(cost, bool) or not isinstance(cost, int) or not 0 <= cost <= 1000:
+        raise ValidationError("credits.task_cost must be an int in 0..1000")
+    return CreditsConfig(task_cost=cost)
 
 
 
@@ -482,6 +507,7 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
     capability = _parse_capability_template(raw.get("capability", _DEFAULTS["capability"]))
     discovery = _parse_discovery(raw.get("discovery", _DEFAULTS["discovery"]))
     lease = _parse_lease(raw.get("lease", _DEFAULTS["lease"]))
+    credits = _parse_credits(raw.get("credits", _DEFAULTS["credits"]))
 
     return NodeConfig(
         node_id=node_id,
@@ -497,6 +523,7 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
         capability=capability,
         discovery=discovery,
         lease=lease,
+        credits=credits,
         coordinator_node_id=coordinator_node_id,
         coordinator_addr=coordinator_addr,
         poll_interval_seconds=poll_interval_seconds,
@@ -550,6 +577,7 @@ class NodeConfig:
     capability: dict[str, Any] | None = None
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
+    credits: CreditsConfig = field(default_factory=CreditsConfig)
     coordinator_node_id: str | None = None
     coordinator_addr: str | None = None
     poll_interval_seconds: int = 5
@@ -588,6 +616,9 @@ class NodeConfig:
             "lease": {
                 "mode": self.lease.mode,
                 "proposal_timeout_seconds": self.lease.proposal_timeout_seconds,
+            },
+            "credits": {
+                "task_cost": self.credits.task_cost,
             },
             "coordinator_node_id": self.coordinator_node_id,
             "coordinator_addr": self.coordinator_addr,
