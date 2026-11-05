@@ -1,4 +1,4 @@
-# D4 验收矩阵（最终审计）
+# D4 验收矩阵（最终审计；复核记录见 D4-AUDIT-RECHECK.md）
 
 HEAD：`7faa7b5` + 本轮审计修复（提交见最终报告）
 基线：446/446；本轮：460/460（446 + 13 审计回归 + 1 未见？见日志）
@@ -28,12 +28,12 @@ HEAD：`7faa7b5` + 本轮审计修复（提交见最终报告）
 | B3 | 重复 ACCEPT 幂等 | PASS | `test_accept_is_idempotent_and_guards_other_signatures` |
 | B4 | 重复 COMMIT/activate 幂等 | PASS | `test_commit_is_idempotent`、`test_lease_audit.py::test_concurrent_activate_is_idempotent` |
 | B5 | 同一 task 不产生两个 ACTIVE lease（并发） | PASS | 唯一索引 `one_active_lease`；`test_lease_audit.py::test_two_threads_claiming_the_same_task_never_create_two_leases` |
-| B6 | 两个 worker 同时 ACCEPT 同一 task | NOT TESTED | 只有 DB 唯一约束与单写者保证，无真实双 worker 协议级并发测试 |
-| B7 | accept vs expire | NOT TESTED | 无确定性竞态测试 |
-| B8 | cancel vs execute | NOT TESTED | 有 `_cancelled_leases` 机制，无节点级竞态测试 |
+| B6 | 两个 worker 同时 ACCEPT 同一 task | PASS | `test_d4_two_worker_accept.py`（并发/顺序：仅被寻址 worker 被接受） |
+| B7 | accept vs expire | PASS | `test_d4_accept_expire.py`（边界/回滚/barrier 竞态，永不 ACTIVE） |
+| B8 | cancel vs execute | PASS（语义级） | `test_d4_cancel_execute.py`（取消门/幂等/ACTIVE 不可取消/accept-cancel 竞态） |
 | B9 | CANCEL 精确语义 | PARTIAL | 非 ACTIVE 可取消（幂等）；ACTIVE 拒绝取消（不假装中断），见 `TASK-LEASE-PROTOCOL.md` §8.2；`test_expired_or_cancelled_lease_cannot_be_revived` |
 | B10 | 过期清理不删防重放状态 | PASS | negotiation 行保留为 EXPIRED；`_expire_locked` 仅改状态 |
-| B11 | DB 写失败不确认成功 | NOT TESTED | 代码路径 catch 后回 ERROR，无注入测试 |
+| B11 | DB 写失败不确认成功 | PASS | `test_d4_db_failure.py`（Store + node handler：ERROR 且无 LEASE_COMMIT） |
 
 ## C. 重启恢复
 
@@ -42,7 +42,7 @@ HEAD：`7faa7b5` + 本轮审计修复（提交见最终报告）
 | C1 | PROPOSED/ACCEPTED 重启不自动 ACTIVE | PASS | `test_lease_audit.py::test_unfinished_negotiation_does_not_become_active_on_reopen` |
 | C2 | 过期/取消不能恢复执行 | PASS | `test_expired_or_cancelled_lease_cannot_be_revived`、`test_old_authorization_is_rejected_after_expiry` |
 | C3 | ACTIVE 过期后协商级联 EXPIRED | PASS | `test_expiring_the_lease_expires_the_active_negotiation`（`db.py::_expire_locked`） |
-| C4 | worker 重启不执行旧授权 | PARTIAL | worker 无本地租约状态，重启只能重新 claim；无专门重启测试 |
+| C4 | worker 重启不执行旧授权 | PASS（语义级） | `test_d4_worker_restart.py`（无持久化授权、必须重新 claim、过期授权拒绝） |
 | C5 | 断线期间 fail-closed | PARTIAL | 未执行就无法复用；无断线恢复测试 |
 
 ## D. 结果防重放与账本
@@ -60,7 +60,7 @@ HEAD：`7faa7b5` + 本轮审计修复（提交见最终报告）
 | # | 项 | 结论 | 证据 |
 | --- | --- | --- | --- |
 | E1 | 空 v2 库升级 | PASS | `test_store.py::test_v1_database_migrates_in_place_to_schema_v3` |
-| E2 | 含既有数据的 v2 升级 | PASS | `test_store` 迁移测试保留既有事件/结果 |
+| E2 | 含既有数据的 v2 升级 | PASS | `test_d4_v2_migration.py`（既有 task/lease 保留、重复打开不重复迁移） |
 | E3 | v3 重复启动不重复迁移 | PASS | `CREATE TABLE IF NOT EXISTS` + `UPDATE meta`（幂等） |
 | E4 | 迁移失败不留半升级 | PASS | `test_lease_audit.py::test_failed_migration_keeps_schema_version_2_and_retries`（失败时仍为 v2） |
 | E5 | 旧 lease 不被误认作双签授权 | PASS | 执行只认 `LeaseCommit` 签名；旧行无 commit |
@@ -73,7 +73,7 @@ HEAD：`7faa7b5` + 本轮审计修复（提交见最终报告）
 | --- | --- | --- | --- |
 | F1 | 5 种消息精确 schema/大小 | PASS | `protocol.py` + `test_protocol.py`（count 24） |
 | F2 | 全部定向，禁止广播 | PASS | `DIRECTED_TYPES`；`test_protocol.py::TestCapabilityMessages`/recipient 断言 |
-| F3 | 节点级错投/广播拒绝（租约消息） | NOT TESTED | 协议层已测；无节点级租约消息错投测试 |
+| F3 | 节点级错投/广播拒绝（租约消息） | PASS | `test_d4_lease_recipient.py`（真实 TCP coordinator + ManualPeer） |
 | F4 | seq/防重放 | PASS | 既有信封 seq 窗口 + 公告侧测试 |
 
 ## G. 真实链路
