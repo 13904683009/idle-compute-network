@@ -40,6 +40,46 @@ python -m idle_compute credit --db var/demo/idle.db --peer <peer>
 {"credit": {"demo-buyer": {"earned": 2, "held": 0, "spent": 1, "refunded": 1, "available": 1}}}
 ```
 
+## 1a. 真实节点 loopback 网络演示（三进程）
+
+```bash
+python scripts/demo_network_loopback.py --dir var/demo-network --reset
+```
+
+脚本在**同一台机器、127.0.0.1** 启动真实进程并走完整 wire 路径：
+
+1. **免费路径**：coordinator（`credits.task_cost=0`）+ worker + client；
+   `node create-task` → `TASK_CREATE_ACK` → claim → `LEASE_PROPOSE` → `LEASE_ACCEPT`
+   → `LEASE_COMMIT` → 执行 → 验证 → 1 CREDIT；
+2. **付费路径**：重启同一个 coordinator DB，`credits.task_cost=1`；client 复用免费阶段
+   **已赚到 1 CREDIT 的 worker 身份**，先创建付费任务（此时 worker 尚未启动，便于观察
+   `held=1`），再启动新 worker 完成该任务 → `spent=1`；
+3. **余额不足**：同一 client 再创建付费任务 → `INSUFFICIENT_CREDIT`（wire code 17），
+   不产生任务；
+4. 每一步后调用 `python -m idle_compute credit --db var/demo-network/coord/coordinator.db --peer <worker_id>`。
+
+关键输出示例（节选）：
+
+```text
+[1] Free path (coordinator credits.task_cost=0)
+    client: TASK_CREATE -> tsk_...
+    client: task tsk_... -> COMPLETED
+    credit: earned=1 held=0 spent=0 available=1
+
+[2] Paid path (same DB restarted with credits.task_cost=1)
+    client: TASK_CREATE -> tsk_...
+    credit: earned=1 held=1 spent=0 available=0
+    coord: lease lea_... final negotiation state=COMPLETED
+    credit: earned=1 held=0 spent=1 available=0
+
+[3] Paid path: second task with 0 available credit
+    rejected with INSUFFICIENT_CREDIT (wire code 17)
+```
+
+> **范围**：单机 loopback / 127.0.0.1；**非跨设备、非 D6**。它验证真实三进程 wire 路径，
+> 但没有验证两台物理设备、防火墙、NAT、时钟偏差或断线恢复，不能作为 D6 证据。
+> 日志在 `var/demo-network/*.log`；失败时脚本会终止所有子进程。
+
 ## 2. 手动免费路径（只用 Phase-1 CLI）
 
 ```bash
