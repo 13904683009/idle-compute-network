@@ -20,7 +20,8 @@
 
 ## 2. 发布前仍需**人工**完成的决定
 
-1. **许可证**：仓库当前没有 `LICENSE`。公开前由所有者决定许可证并添加（不要默认 MIT 而不确认版权归属）。
+1. **许可证**：已添加 **MIT License**（`LICENSE`，Copyright 2026 Idle Compute Network contributors）；
+   如团队需要 Apache-2.0，请在发布前与所有者确认后再替换。
 2. **仓库名/可见性**：由所有者决定 public/private；团队模拟建议先 private，跑通后再 public。
 3. **历史提交信息**：包含阶段报告与内部审计措辞；确认团队可接受后再发布。
 4. **分支**：当前分支 `phase2`；GitHub 默认分支由所有者选择（建议发布分支另建，如 `release/team-sim`）。

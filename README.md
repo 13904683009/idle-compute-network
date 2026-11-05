@@ -139,4 +139,4 @@ python -m compileall -q idle_compute tests
 
 ## 许可
 
-仓库当前**未附许可证**；公开发布前请由仓库所有者确认许可证与版权声明。
+本项目采用 **MIT License**，见 [LICENSE](LICENSE)。
