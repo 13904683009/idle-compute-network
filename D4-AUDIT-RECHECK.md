@@ -59,6 +59,6 @@
 | accept vs expire | 490/490 OK（`d4-gap-3-cancel-execute.log` 覆盖 1–3；gap-2 日志因并发加入未提交测试而含 1 个陈旧错误，已用 gap-3 全量替代） |
 | DB 写失败 | 493/493 OK（`d4-gap-4-db-failure.log`） |
 | 节点级错投/广播 | 496/496 OK（`d4-gap-5-lease-recipient.log`） |
-| worker 重启 + v2 迁移 + 文档 | 501/501 OK（`d4-gap-6-worker-restart.log`） |
+| worker 重启 + v2 迁移 + 文档 | 501/501 OK（`d4-gap-6-worker-restart-final.log`；首次运行仅因 Windows 临时目录清理句柄抖动报 1 个 cleanup error，`test_log` 的 TemporaryDirectory 加 `ignore_cleanup_errors=True` 后重跑全绿，断言未改） |
 
 注：gap-2 的日志保留原样（含失败）以保持审计可追溯；最终结论以 gap-3/4/5/6 的全量日志为准。

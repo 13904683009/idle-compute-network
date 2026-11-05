@@ -134,7 +134,7 @@ class LogCaptureTests(unittest.TestCase):
     """Real processes at DEBUG; the written logs must not leak secrets."""
 
     def setUp(self) -> None:
-        self._tmp = TemporaryDirectory(prefix="log-capture-")
+        self._tmp = TemporaryDirectory(prefix="log-capture-", ignore_cleanup_errors=True)
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
         self.coord_dir = self.root / "coord"
