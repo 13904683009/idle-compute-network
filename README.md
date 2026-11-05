@@ -12,10 +12,10 @@
 
 | 项 | 状态 |
 | --- | --- |
-| D1–D5 | 已完成（能力/公告/匹配器/双签租约/本地模拟注册表） |
+| D1–D5 | 已完成（能力/公告/匹配器/双签租约/本地模拟注册表，已接入节点与 matcher） |
 | 测试 | **479 项**标准库 unittest，全部通过（`python -m unittest discover -s tests -v`） |
 | 真实双设备（D6） | **未执行**；文档与测试仅覆盖单机多进程 |
-| 链上注册表 / 共识 / 代币 | **未实现**；`LocalRegistryAdapter` 只是本地 SQLite 模拟，且**尚未接入**节点/匹配器 |
+| 链上注册表 / 共识 / 代币 | **未实现**；`LocalRegistryAdapter` 只是本地 SQLite 模拟，已接入节点告示与 matcher 的 registry-first 校验，**不是**链上/共识 |
 | 公网 / NAT 穿透 / relay / DHT / mDNS | **未实现**；仅支持可路由的局域网直连 |
 | 生产就绪 | **否**；未做安全审计与负载测试 |
 
@@ -127,7 +127,7 @@ python -m compileall -q idle_compute tests
   验证 commit 后执行。`lease.mode` 只接受 `dual_signed`。
 - recipient 定向校验；能力/租约广播有明确限制；未知/非法消息 fail-closed。
 - 结果由协调者独立重算；同一任务只产生一条 CREDIT。
-- 能力与硬件信息是**节点自述**，不是可信证明；注册表是本地模拟，未参与调度。
+- 能力与硬件信息是**节点自述**，不是可信证明；注册表是本地模拟（非链上/共识），只用于 matcher 的 registry-first 校验。
 - 详见 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)、[TASK-LEASE-PROTOCOL.md](TASK-LEASE-PROTOCOL.md)。
 
 ## 目录

@@ -64,7 +64,8 @@ python -m unittest discover -s tests -q          # 期望 OK（479）
 - 链上注册表、共识、代币、真实支付（均未实现）。
 - DHT / Gossip / Relay / mDNS / NAT 穿透（均未实现）。
 - 生产可用或已完成安全审计。
-- D5 `LocalRegistryAdapter` 已参与调度（**尚未接入**节点/匹配器）。
+- D5 `LocalRegistryAdapter` 已接入节点与 matcher（registry-first）；它仍是本地模拟，
+  不得称为链上注册表或跨节点共识。
 
 ## 6. 已知风险（发布说明中应保留）
 

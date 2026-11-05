@@ -85,6 +85,12 @@ NOT_ACCEPTING = "NOT_ACCEPTING"
 RELAY_NOT_ALLOWED = "RELAY_NOT_ALLOWED"
 DATA_POLICY_UNPROVEN = "DATA_POLICY_UNPROVEN"
 VERIFICATION_UNPROVEN = "VERIFICATION_UNPROVEN"
+# D5 registry-first matching: the registry is authoritative when it has a
+# record; a missing record falls back to the in-memory announcement cache.
+REGISTRY_REVOKED = "REGISTRY_REVOKED"
+REGISTRY_EXPIRED = "REGISTRY_EXPIRED"
+REGISTRY_NOT_FINAL = "REGISTRY_NOT_FINAL"
+REGISTRY_MISMATCH = "REGISTRY_MISMATCH"
 
 #: Fields that come from the candidate's own claim, not from an independent
 #: measurement. Reported per evaluation so callers cannot mistake them for
@@ -149,6 +155,9 @@ class CandidateEvaluation:
     breakdown: tuple[tuple[str, int], ...]
     trust_level: str
     accepting_tasks: bool
+    #: True only when the LocalRegistryAdapter confirmed this exact manifest
+    #: (FINAL, same hash/version); False means "cache fallback / unregistered".
+    registry_verified: bool = False
 
     def scores(self) -> dict[str, int]:
         return dict(self.breakdown)
@@ -177,6 +186,7 @@ class MatchResult:
                     "score": item.score,
                     "breakdown": dict(item.breakdown),
                     "trust_level": item.trust_level,
+                    "registry_verified": item.registry_verified,
                     "self_declared_fields": list(SELF_DECLARED_FIELDS),
                 }
                 for item in self.ranking
@@ -204,6 +214,7 @@ def match(
     *,
     now: int,
     verify_signatures: bool = True,
+    registry: Any | None = None,
 ) -> MatchResult:
     """Filter, score and rank ``candidates`` for ``requirement`` at ``now``.
 
@@ -217,7 +228,15 @@ def match(
 
     evaluations: list[CandidateEvaluation] = []
     for raw in candidates:
-        evaluations.append(_evaluate(requirement, raw, now=now, verify_signatures=verify_signatures))
+        evaluations.append(
+            _evaluate(
+                requirement,
+                raw,
+                now=now,
+                verify_signatures=verify_signatures,
+                registry=registry,
+            )
+        )
 
     evaluations.sort(key=lambda item: item.node_id)
     ranking = sorted(
@@ -261,6 +280,7 @@ def _evaluate(
     *,
     now: int,
     verify_signatures: bool,
+    registry: Any | None = None,
 ) -> CandidateEvaluation:
     node_id = getattr(raw, "node_id", "<unknown>")
     codes: list[str] = []
@@ -314,6 +334,31 @@ def _evaluate(
                 reject(MALFORMED_CAPABILITY, f"announcement: {exc.message}")
     elif not verify_signatures and announcement.expires_at <= now:
         reject(ANNOUNCEMENT_EXPIRED, f"expires_at={announcement.expires_at} <= now={now}")
+
+    # D5 registry-first: a FINAL registry record for exactly this manifest
+    # wins; a missing record falls back to the announcement cache. A record
+    # that exists but is revoked/expired/pending/mismatched is authoritative
+    # and rejects the candidate (cache cannot override the registry).
+    registry_verified = False
+    if registry is not None:
+        try:
+            record = registry.get(manifest.node_id, now=now)
+        except Exception:
+            record = None  # registry unavailable -> cache fallback (fail open to cache)
+        if record is not None:
+            if record.status == "REVOKED":
+                reject(REGISTRY_REVOKED, "registry says this capability version is revoked")
+            elif record.status == "EXPIRED":
+                reject(REGISTRY_EXPIRED, "registry record has expired")
+            elif record.status == "PENDING":
+                reject(REGISTRY_NOT_FINAL, "registry record is PENDING, not final")
+            elif (
+                record.manifest_hash != manifest.hash()
+                or record.capability_version != manifest.capability_version
+            ):
+                reject(REGISTRY_MISMATCH, "registry holds a different manifest/version")
+            else:
+                registry_verified = True
 
     # Trust flags from the discovery layer -----------------------------------
     if bool(getattr(raw, "revoked", False)):
@@ -401,6 +446,7 @@ def _evaluate(
         breakdown=breakdown,
         trust=trust_level,
         accepting=bool(announcement.accepting_tasks),
+        registry_verified=registry_verified,
     )
 
 
@@ -413,6 +459,7 @@ def _evaluation(
     breakdown: Sequence[tuple[str, int]],
     trust: str,
     accepting: bool,
+    registry_verified: bool = False,
 ) -> CandidateEvaluation:
     return CandidateEvaluation(
         node_id=node_id,
@@ -423,6 +470,7 @@ def _evaluation(
         breakdown=tuple(breakdown),
         trust_level=trust,
         accepting_tasks=accepting,
+        registry_verified=registry_verified,
     )
 
 

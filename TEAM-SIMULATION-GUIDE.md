@@ -265,7 +265,8 @@ python -c "import sqlite3,json;c=sqlite3.connect('var/team/coord/coordinator.db'
 
 - 公网、NAT 穿透、relay、DHT/mDNS（均未实现）。
 - 真实断线重连/进程重启恢复的自动验证（D4 仍有 NOT TESTED 项，见 `D4-ACCEPTANCE-MATRIX.md`）。
-- 能力公告/匹配器参与调度、D5 注册表接入（**注册表尚未接线**，不得声称参与调度）。
+- 能力公告/匹配器参与调度、D5 注册表参与调度（注册表已接入节点与 matcher 的
+  registry-first 校验，但仍是本地模拟、非链上/共识；不得声称链上注册或跨设备共识）。
 - 性能/容量结论（本指南不测吞吐；不要用 loopback 基准代表跨设备性能）。
 - 安全审计结论（本仓库未做生产级安全审计）。
 

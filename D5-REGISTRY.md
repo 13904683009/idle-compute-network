@@ -52,7 +52,21 @@ registered_at, finalize_at, finalized_at, expires_at, revoked_reason`。
 4. 不替代公告缓存：公告表达实时状态，注册表表达可验证承诺（D0 §6）。
 5. 不宣称"链上"、不提供代币/支付；无 DHT/Gossip/Relay/mDNS。
 
-## 5. 测试对照（20 项）
+## 5. D5 收尾：节点与 Matcher 接入
+
+- 节点：`Node.run()` 启动时注册自己的 manifest；`publish_announcement()` 再次注册（版本更新）。
+- 接收：`CAPABILITY_ANNOUNCE` / `CAPABILITY_RESPONSE` 中通过校验的 manifest 同步写入本节点注册表。
+- 撤销：`Node.revoke_capability(version, reason)` 同时撤销公告缓存与注册表（版本级）。
+- 匹配：`Node.match_candidates(requirement)` 从公告缓存取候选，并把 `LocalRegistryAdapter` 传给
+  `matcher.match(..., registry=...)`；FINAL 且 hash/version 一致 → `registry_verified=True`。
+  - 注册表有记录但 REVOKED / EXPIRED / PENDING / 不一致 → 直接拒绝（缓存不能覆盖注册表）；
+  - 注册表**无记录**（或读取异常）→ 回退到内存公告缓存（`registry_verified=False`）。
+- 评分公式不变；注册表只作为候选准入的权威来源与解释字段，不引入链/代币/支付。
+
+> 注意：注册表仍是**本地模拟**（单文件、单写者、无复制/共识）；`registry_verified` 只表示
+> "与本地注册表记录一致"，不是跨节点共识或硬件验证。
+
+## 6. 测试对照（20 项）
 
 | 规则 | 测试 |
 | --- | --- |

@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import ledger
-from .capability import CapabilityError
+from .capability import CapabilityError, CapabilityManifest, CapabilityRevocation
 from .config import NodeConfig, ValidationError, is_valid_node_id
 from .db import (
     DuplicateSubmission,
@@ -77,6 +77,7 @@ from .identity import NodeIdentity
 from .crypto import canonical_json, content_hash
 from .lease import LeaseCommit, LeaseError, TaskLeaseTerms, authorization_from_commit, terms_hash
 from .log import install_redaction
+from .registry import LocalRegistryAdapter, RegistryError
 from .models import Lease, LeaseStatus, Task, TaskStatus, ValidationStatus, new_id, utc_now
 from .net_transport import (
     Libp2pTransport,
@@ -307,6 +308,7 @@ class Node:
         self._discovery: AnnouncementCache | None = None
         self._discovery_store: DiscoveryStateStore | None = None
         self._discovery_lock = threading.Lock()
+        self._registry: LocalRegistryAdapter | None = None
         self._publish_sequence = 0
         self._last_publish_at = 0.0
         # D4: leases the coordinator cancelled while this worker was negotiating.
@@ -564,6 +566,60 @@ class Node:
 
     # ------------------------------------------------------- discovery (D2)
 
+    def _registry_adapter(self) -> LocalRegistryAdapter:
+        """Lazily open the local simulated registry (D5, same data_dir)."""
+        adapter = self._registry
+        if adapter is not None:
+            return adapter
+        with self._discovery_lock:
+            if self._registry is None:
+                self._data_dir.mkdir(parents=True, exist_ok=True)
+                self._registry = LocalRegistryAdapter(self._data_dir / "registry.db")
+            return self._registry
+
+    def _register_manifest(self, manifest: CapabilityManifest) -> None:
+        """Persist a signed manifest commitment; registry failure is logged, not fatal."""
+        try:
+            self._registry_adapter().register(manifest, now=int(time.time()))
+        except (RegistryError, CapabilityError) as exc:
+            logger.warning("registry write failed for %s: %s", manifest.node_id[:12], exc)
+
+    def _register_own_capability(self) -> None:
+        template = self.config.capability
+        if not template:
+            return
+        try:
+            manifest = build_manifest(template, self.identity, now=int(time.time()))
+            self._register_manifest(manifest)
+        except (CapabilityError, ValueError) as exc:
+            logger.warning("own capability registration failed: %s", exc)
+
+    def revoke_capability(self, capability_version: int, reason: str = "revoked") -> None:
+        """Revoke this node's own capability version in the cache AND registry."""
+        revocation = CapabilityRevocation(
+            node_id=self.identity.node_id,
+            capability_version=int(capability_version),
+            issued_at=int(time.time()),
+            reason=reason,
+        ).sign(self.identity)
+        cache = self._discovery_cache()
+        with self._discovery_lock:
+            cache.revoke(revocation, now=time.time())
+        self._registry_adapter().revoke(revocation, now=int(time.time()))
+
+    def match_candidates(self, requirement: Any, *, now: int | None = None) -> Any:
+        """D5: registry-first matching over the in-memory announcement cache."""
+        from .matcher import Candidate, match as match_capabilities
+
+        moment = int(time.time()) if now is None else int(now)
+        cache = self._discovery_cache()
+        with self._discovery_lock:
+            entries = cache.lookup(include_unreachable=True, now=moment)
+        candidates = [Candidate.from_cache_entry(entry) for entry in entries]
+        return match_capabilities(
+            requirement, candidates, now=moment, registry=self._registry_adapter()
+        )
+
     def _discovery_cache(self) -> AnnouncementCache:
         """Lazily open the announcement cache + its persisted state file."""
         cache = self._discovery
@@ -595,6 +651,10 @@ class Node:
                     sender_node_id=env.sender,
                 )
             if result.accepted:
+                try:
+                    self._register_manifest(CapabilityManifest.from_dict(env.body["manifest"]))
+                except CapabilityError as exc:
+                    logger.warning("peer manifest registration failed: %s", exc)
                 logger.debug("capability announcement accepted from %s", env.sender[:12])
             else:
                 logger.info(
@@ -615,6 +675,9 @@ class Node:
                     {"manifest": peer.manifest.to_dict(), "announcement": peer.announcement.to_dict()}
                     for peer in peers
                 ]
+            logger.debug(
+                "capability query from %s matched %d peers", env.sender[:12], len(payload)
+            )
             self._reply(
                 write,
                 MessageType.CAPABILITY_RESPONSE,
@@ -624,6 +687,7 @@ class Node:
             return True
         if env.type is MessageType.CAPABILITY_RESPONSE:
             accepted = 0
+            accepted_manifests: list[dict[str, Any]] = []
             with self._discovery_lock:
                 for entry in env.body["peers"]:
                     if not isinstance(entry, dict):
@@ -633,6 +697,12 @@ class Node:
                     )
                     if result.accepted:
                         accepted += 1
+                        accepted_manifests.append(entry["manifest"])
+            for raw_manifest in accepted_manifests:
+                try:
+                    self._register_manifest(CapabilityManifest.from_dict(raw_manifest))
+                except CapabilityError as exc:
+                    logger.warning("peer manifest registration failed: %s", exc)
             self._replies.put(env)  # let a waiting query_capabilities() see it
             logger.debug(
                 "capability response from %s: %d/%d entries accepted",
@@ -654,6 +724,9 @@ class Node:
             raise NodeError("config has no 'capability' section to announce")
         now = int(time.time())
         manifest = build_manifest(template, self.identity, now=now)
+        # D5: publish registers the signed commitment locally (registry-first
+        # matching looks here before the in-memory announcement cache).
+        self._register_manifest(manifest)
         cache = self._discovery_cache()
         with self._discovery_lock:
             if self._publish_sequence == 0 and self._discovery_store is not None:
@@ -1267,6 +1340,10 @@ class Node:
         self._configure_logging()
         self._loop_thread: threading.Thread | None = threading.current_thread()
         try:
+            # D5: persist this node's capability commitment at startup (before
+            # any announcement) so the registry is authoritative from boot.
+            if self.config.capability:
+                self._register_own_capability()
             self._ensure_transport_started()
             if self.config.role == "coordinator":
                 self._coordinator_loop()
@@ -1634,8 +1711,14 @@ class Node:
         )
         timeout = float(self.config.lease.proposal_timeout_seconds)
         try:
-            env = self._await(lambda e: e.type is MessageType.LEASE_PROPOSE, timeout, seq)
+            env = self._await(
+                lambda e: e.type in (MessageType.LEASE_PROPOSE, MessageType.CLAIM_DENIED),
+                timeout,
+                seq,
+            )
         except NodeTimeoutError:
+            return
+        if env.type is MessageType.CLAIM_DENIED:
             return
         try:
             terms = TaskLeaseTerms.from_dict(env.body["terms"])
@@ -1811,6 +1894,12 @@ class Node:
             logger.debug("closing the discovery state failed: %s", exc)
         self._discovery_store = None
         self._discovery = None
+        try:
+            if self._registry is not None:
+                self._registry.close()
+        except Exception as exc:
+            logger.debug("closing the registry failed: %s", exc)
+        self._registry = None
         # Detach the per-node file handler last: after this the log file is
         # closed and (on Windows) no longer locked against deletion.
         self._detach_log_handler()

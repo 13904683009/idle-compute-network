@@ -89,8 +89,8 @@ TCP transport、无 NAT/relay/DHT；`cross_device=false`。原始 JSON 在基准
 | R10 | 源码/文档门禁 | PASS | 两门禁 diff = 0；`test_source_safety` 通过 |
 | B1 | 基准可重复、环境标注 | PASS | `d5-transport-bench.log`（cross_device=false） |
 | B2 | 传输优化是否需要 | PASS（结论：不需要） | 第 5 节数据 |
-| I1 | 注册表接入节点/匹配器 | NOT TESTED | 路线图 D5 未要求；需 D6 授权 |
-| I2 | 注册表撤销联动公告缓存 | NOT TESTED | 未实现（D6 设计项） |
+| I1 | 注册表接入节点/匹配器 | PASS | `tests/test_d5_registry_integration.py`（11）：启动/公告注册、接收同步、撤销同步、版本推进、matcher registry-first |
+| I2 | 注册表撤销联动公告缓存 | PASS | `Node.revoke_capability` + `test_revoke_syncs_cache_and_registry` |
 | I3 | 真实双设备 | NOT TESTED | D6，未执行 |
 | D4 | D4 遗留 PARTIAL/NOT TESTED | 不变 | 见 `D4-ACCEPTANCE-MATRIX.md`；D5 未触碰租约路径 |
 
@@ -108,4 +108,14 @@ TCP transport、无 NAT/relay/DHT；`cross_device=false`。原始 JSON 在基准
 - D5 按路线图交付：注册表接口 + 本地适配器 + 20 项测试 + 基准与文档。
 - **不宣称**已实现链上注册表、跨设备性能结论、D5 节点集成或 D6。
 - 建议：D6 前先决定注册表是否/如何接入匹配器与撤销联动，并补 D4 遗留竞态测试。
+
+## 9. D5 收尾：注册表已接入（2026-11-05）
+
+- 节点启动/公告写入 `LocalRegistryAdapter`；接收公告/响应同步写入；
+  `Node.revoke_capability` 同时撤销缓存与注册表；`Node.match_candidates` 以注册表优先、
+  内存公告缓存回退（`matcher.match(..., registry=...)`，新增 `registry_verified` 解释字段与
+  `REGISTRY_REVOKED/EXPIRED/NOT_FINAL/MISMATCH` 拒绝码）。
+- 回归：`tests/test_d5_registry_integration.py`（11 项）；**未引入链/代币/钱包/支付**，
+  注册表仍是本地模拟。
+
   现在停止，等待审计。
