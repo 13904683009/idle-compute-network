@@ -113,6 +113,9 @@ python -m idle_compute node status --config var/quick/client/node.json --task-id
 
 ## CREDIT 兑换算力
 
+查看余额：`python -m idle_compute credit --db var/idle.db [--peer <node_id>]`，输出
+`earned/held/spent/refunded/available`。
+
 `credits.task_cost`（默认 0）> 0 时，`TASK_CREATE` 会先检查 requester 的可用余额，不足返回 `INSUFFICIENT_CREDIT`（wire code 17）；任务创建与冻结在同一事务内，成功 `SPENT`、失败/取消/过期 `REFUNDED`。语义与限制见 [CREDIT-EXCHANGE.md](CREDIT-EXCHANGE.md)。
 
 ## 测试

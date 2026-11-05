@@ -926,6 +926,39 @@ class Store:
     def balances(self) -> dict[str, int]:
         return ledger.rebuild_ledger(self.conn, self.signer)["balances"]
 
+    def credit_summary(self) -> dict[str, dict[str, int]]:
+        """Per-peer earned/held/spent/refunded/available (no ledger rewrite).
+
+        ``available`` uses ``available_credit``; held/spent/refunded are
+        aggregated from ``credit_holds``; earned = available + held + spent.
+        """
+        peers: set[str] = set()
+        for row in self.conn.execute("SELECT DISTINCT peer_id FROM credit_events"):
+            peers.add(row["peer_id"])
+        for row in self.conn.execute("SELECT DISTINCT requester_id FROM credit_holds"):
+            peers.add(row["requester_id"])
+        summary: dict[str, dict[str, int]] = {}
+        for peer in sorted(peers):
+            amounts = {"held": 0, "spent": 0, "refunded": 0}
+            rows = self.conn.execute(
+                "SELECT state, COALESCE(SUM(amount),0) AS total FROM credit_holds "
+                "WHERE requester_id=? GROUP BY state",
+                (peer,),
+            ).fetchall()
+            for row in rows:
+                key = str(row["state"]).lower()
+                if key in amounts:
+                    amounts[key] = int(row["total"])
+            available = self.available_credit(peer)
+            summary[peer] = {
+                "earned": available + amounts["held"] + amounts["spent"],
+                "held": amounts["held"],
+                "spent": amounts["spent"],
+                "refunded": amounts["refunded"],
+                "available": available,
+            }
+        return summary
+
     def list_events(self, peer_id: str | None = None):
         return ledger.iter_events(self.conn, peer_id)
 

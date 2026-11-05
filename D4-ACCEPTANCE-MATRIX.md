@@ -43,7 +43,7 @@ HEAD：`7faa7b5` + 本轮审计修复（提交见最终报告）
 | C2 | 过期/取消不能恢复执行 | PASS | `test_expired_or_cancelled_lease_cannot_be_revived`、`test_old_authorization_is_rejected_after_expiry` |
 | C3 | ACTIVE 过期后协商级联 EXPIRED | PASS | `test_expiring_the_lease_expires_the_active_negotiation`（`db.py::_expire_locked`） |
 | C4 | worker 重启不执行旧授权 | PASS（语义级） | `test_d4_worker_restart.py`（无持久化授权、必须重新 claim、过期授权拒绝） |
-| C5 | 断线期间 fail-closed | PARTIAL | 未执行就无法复用；无断线恢复测试 |
+| C5 | 断线期间 fail-closed | PASS（最小语义） | `tests/test_c5_restart.py`：重启后任务仍 QUEUED、hold 仍 HELD、无 lease/negotiation；必须显式 claim+提议+接受+激活；不实现自动恢复 |
 
 ## D. 结果防重放与账本
 
@@ -86,12 +86,12 @@ HEAD：`7faa7b5` + 本轮审计修复（提交见最终报告）
 ## 结论
 
 - **执行授权绕过已关闭**（A1–A5、A7）：节点无法启用 legacy，claim 只能走双签，执行只认 commit。
-- **状态机/重启/结果/迁移**核心项 PASS；仍有 B6/B7/B8/B11、C4/C5、F3 未测试，
+- **状态机/重启/结果/迁移**核心项 PASS；B6/B7/B8/B11/C4/E2/F3 已补回归；C5 最小语义 PASS；G2 真实双设备仍 NOT TESTED，
   以及 A6 的本地 CLI 隔离仅有代码论证。
 - **D4 仍不满足"全部 27 项"验收**；建议审计针对上述 NOT TESTED 项决定是否接受。
 
 ## D5 接入后的 D4 状态复核
 
 - A6（本地 Phase-1 CLI 隔离）：仍 **PARTIAL**。D5 未改变 `coordinator.run_one` 的本地执行路径，也没有新增“不可由网络触发”的测试。
-- C5（断线恢复）：仍 **PARTIAL**。D5 注册表接入不涉及断线/重连租约恢复；不得把本地注册表当作恢复机制。
+- C5（断线恢复）：**PASS（最小语义）**。`tests/test_c5_restart.py` 证明重启后不自动 ACTIVE/执行、必须重新 claim 与显式双签流程；**未实现自动重连/恢复**，不得宣称断线可恢复。
 - 其余 D4 条目不因 D5 改变；D6 仍未执行。

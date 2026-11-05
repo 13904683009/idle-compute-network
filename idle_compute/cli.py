@@ -333,6 +333,24 @@ def cmd_balances(args: argparse.Namespace) -> int:
         coordinator.close()
 
 
+def cmd_credit(args: argparse.Namespace) -> int:
+    """Show earned/held/spent/refunded/available CREDIT per peer."""
+    coordinator = _coordinator(args)
+    try:
+        summary = coordinator.store.credit_summary()
+    finally:
+        coordinator.close()
+    if args.peer:
+        summary = {
+            args.peer: summary.get(
+                args.peer,
+                {"earned": 0, "held": 0, "spent": 0, "refunded": 0, "available": 0},
+            )
+        }
+    _print({"credit": summary})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default="var/idle.db", help="SQLite database path")
@@ -384,6 +402,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     balances = sub.add_parser("balances", parents=[common], help="show ledger balances")
     balances.set_defaults(func=cmd_balances)
+
+    credit = sub.add_parser(
+        "credit",
+        parents=[common],
+        help="show earned/held/spent/refunded/available CREDIT per peer",
+    )
+    credit.add_argument("--peer", default=None, help="only show this peer (zeros if unknown)")
+    credit.set_defaults(func=cmd_credit)
 
     # ---- network commands (--config only, never --db/--key) ----
 

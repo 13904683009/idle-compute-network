@@ -15,8 +15,25 @@ available(peer) = earned(peer) - Σ(credit_holds.amount WHERE state ∈ {HELD, S
 
 - `earned`：现有账本中的 CREDIT 总和（`ledger.rebuild_ledger` 计算，不修改）。
 - `HELD`：任务创建时冻结；`SPENT`：任务成功完成后永久消费；`REFUNDED`：释放。
-- 因此 `idle_compute balances` 仍显示**赚取总额**；"可用余额"是另一个只读概念
-  （`Store.available_credit`），CLI 暂未提供单独命令。
+- `idle_compute balances` 仍显示**赚取总额**；新增 `idle_compute credit` 显示
+  earned/held/spent/refunded/available（数据只来自 `Store.available_credit` 与
+  `credit_holds` 汇总）。
+
+## 3a. 余额查询
+
+```bash
+python -m idle_compute credit --db var/idle.db                 # 所有 peer
+python -m idle_compute credit --db var/idle.db --peer <node_id> # 单个 peer（未知则全 0）
+```
+
+输出示例：
+
+```json
+{"credit": {"buyer": {"earned": 1, "held": 1, "spent": 0, "refunded": 0, "available": 0}}}
+```
+
+`held` 是未结算任务冻结的额度，`spent` 是已完成任务永久消费，`refunded` 是失败/取消/过期
+退回过的额度；`available = earned - held - spent`。
 
 ## 2. 事务边界
 
@@ -66,7 +83,7 @@ available(peer) = earned(peer) - Σ(credit_holds.amount WHERE state ∈ {HELD, S
 ## 6. 已知限制
 
 1. 只有本地 SQLite 记录，没有跨节点/链上结算；协调者单点。
-2. CLI `balances` 显示赚取额，不显示可用额；`Store.available_credit` 目前只有库/测试入口。
+2. `balances` 仍只显示赚取额；可用额请用 `credit` 子命令（本轮已提供）。
 3. 默认 `task_cost=0`（兼容）；不配置时不会真正扣费。
 4. 失败退款是"任务未产生有效结果"的补偿，不构成对恶意 requester 的经济惩罚。
 5. 未与 D5 注册表/匹配器联动定价；价格是全局常量 `task_cost`。
