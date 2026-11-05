@@ -179,7 +179,7 @@ class DualSignedLeaseNetworkTests(unittest.TestCase):
                 "SELECT state FROM lease_negotiations WHERE task_id=?", (task_id,)
             ).fetchone()
             self.assertIsNotNone(neg, "the dual-signed negotiation must be persisted")
-            self.assertEqual(neg[0], "ACTIVE")
+            self.assertEqual(neg[0], "COMPLETED", "the negotiation must be closed by the result")
             active = conn.execute(
                 "SELECT COUNT(*) FROM leases WHERE task_id=? AND status='active'", (task_id,)
             ).fetchone()[0]

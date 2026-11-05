@@ -295,6 +295,15 @@ class Node:
         self._audit_cursor: int | None = None
         # D2 discovery: the cache (and its sqlite state) is created lazily so
         # constructing a Node for validation does not touch the filesystem.
+        # D4 final: a Node ALWAYS runs the dual-signed lease path. This guard
+        # catches a hand-built NodeConfig that bypassed from_dict(), so no
+        # constructor path can enable unsigned execution.
+        if self.config.lease.mode != "dual_signed":
+            raise ValidationError(
+                "lease.mode must be 'dual_signed': the legacy coordinator-grant "
+                "execution path is not available to network nodes"
+            )
+        # D4 discovery/capability state...
         self._discovery: AnnouncementCache | None = None
         self._discovery_store: DiscoveryStateStore | None = None
         self._discovery_lock = threading.Lock()
@@ -1504,10 +1513,13 @@ class Node:
             self._persist_seq()
 
     def _claim_cycle(self, coordinator: str) -> None:
-        if self.config.lease.mode == "dual_signed":
-            self._claim_cycle_dual(coordinator)
-            return
-        claim_request_id = new_id("crq_")
+        # D4 final: the ONLY path from a claim to execution is the dual-signed
+        # negotiation. The historic CLAIM_GRANT body below is unreachable
+        # (Node.__init__ rejects any non-dual mode); it is kept only until the
+        # Worker legacy API is removed, and it can never authorize execution.
+        self._claim_cycle_dual(coordinator)
+        return
+        claim_request_id = new_id("crq_")  # noqa: unreachable legacy body
         seq = self._send_to(
             coordinator,
             MessageType.CLAIM_REQUEST,

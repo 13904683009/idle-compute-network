@@ -173,7 +173,64 @@ worker → coord  SUBMIT_RESULT（原有流程：独立验证 → 记账）
 
 ---
 
-## 7. 测试对照
+## 8. D4 最终审计结论
+
+### 8.1 dual_signed 是唯一正式模式
+
+- `lease.mode` 只接受 **`dual_signed`**；`legacy` 在 `config.from_dict` 阶段即被拒绝
+  （`LEASE_MODES = ("dual_signed",)`），默认值也是 `dual_signed`。
+- `Node.__init__` 二次校验：即使手工构造 `NodeConfig(lease=LeaseConfig(mode="legacy"))`，
+  也会在节点启动前抛 `ValidationError`。因此**任何节点构造路径都无法启用未签名执行**。
+- `node._claim_cycle` 无条件进入 `_claim_cycle_dual`；旧 `CLAIM_GRANT` 执行体保留为不可达
+  dead code（`return` 之后），任何网络消息都不能触发它。
+- 唯一残留的未签名 API 是 `Worker.execute(..., require_dual_signed=False)`，仅被
+  **本地 Phase-1 CLI**（`coordinator.py run-one`）与单元测试直接调用；它不经过 transport、
+  不接收网络租约，也不在节点角色路径中。生产节点始终传 `require_dual_signed=True`。
+
+### 8.2 取消语义（精确）
+
+- `cancel_negotiation` 只允许 **PROPOSED/ACCEPTED → CANCELLED**；
+  对 **ACTIVE** 明确拒绝（`InvalidNegotiationState`）：租约一旦生效，worker 可能已开始执行，
+  本实现**不支持中断运行中的计算**，也不假装支持。取消只保证：
+  - 未 commit 的租约不会被激活；
+  - worker 收到 `LEASE_CANCEL` 后把 lease_id 记入 `_cancelled_leases`，即使随后收到 commit
+    也不会执行；
+  - 已 ACTIVE 的租约只能等待过期/结果提交，后续重试由过期清理处理。
+- 取消/拒绝/过期均幂等；REJECTED/CANCELLED/EXPIRED 不能恢复为 ACTIVE。
+
+### 8.3 重启恢复
+
+- coordinator 重启：`lease_negotiations` 持久化；PROPOSED/ACCEPTED **不会**自动变 ACTIVE；
+  ACTIVE 行只有在其 `leases` 行仍 active 且未过期时保留，否则在事务内被标为 EXPIRED
+  （`_expire_locked` 的级联清理），因此重启后不会留下"看起来有效"的旧授权。
+- worker 重启：没有本地租约状态；只会重新 CLAIM_REQUEST，旧 commit/旧授权不会复用；
+  过期授权在执行门被 `EXPIRED` 拒绝。
+- 任何持久化失败：Store 抛错 → coordinator 回 `ERROR`，不发送 `LEASE_COMMIT`。
+
+### 8.4 结果幂等与账本
+
+- 结果行绑定 `(task_id, lease_id, peer_id)`，唯一约束 `UNIQUE(task_id, lease_id)`；
+  重复提交在 `submit_result` 抛 `DuplicateSubmission`，节点层回放同一 `RESULT_ACK`（不新增账本）。
+- 验证与记账沿用既有事务/幂等键：`credit:<task_id>:<peer_id>`；重复结果不会产生第二条 CREDIT。
+- 未修改 `ledger.py`、哈希链、格式或 CREDIT 语义。
+
+### 8.5 迁移
+
+- v2→v3：`SCHEMA`（`CREATE TABLE IF NOT EXISTS` + `schema_version` 3）与既有列 ALTER 在
+  同一个初始化流程执行；迁移失败时 `schema_version` 仍为 2（失败注入测试验证），修复后重试成功。
+- 不支持 v3→v2 降级（明确不在范围）。
+- 旧 `leases` 行没有 `commit`/双方签名，**不会**被当成双签 ACTIVE 授权：执行只认
+  `LeaseCommit` 签名，旧行最多让结果验证按既有语义处理，不产生新的执行授权。
+
+### 8.6 仍未实现（不改写为已实现）
+
+- 运行中任务的强制终止（不宣称支持）。
+- 断线重连期间"未知状态租约"的自动查询/协调（当前 fail-closed：不执行）。
+- 真实双设备（D6）：时钟偏差/NAT/防火墙未验证。
+- 多 coordinator / 去中心化调度：coordinator 仍是单点权威。
+
+
+## 9. 测试对照
 
 | 规则 | 测试 |
 | --- | --- |

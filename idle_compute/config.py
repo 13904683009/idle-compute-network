@@ -116,9 +116,10 @@ _DISCOVERY_KEYS = frozenset(
         "query_timeout_seconds",
     }
 )
-# D4: default is the SAFE mode. "legacy" is an explicit compatibility opt-in
-# for local tests only; it is never selected implicitly.
-LEASE_MODES = ("dual_signed", "legacy")
+# D4 final: nodes ONLY support the dual-signed lease mode. The historic
+# "legacy" coordinator-grant mode is rejected at config load so a node can
+# never be configured (by file, typo, or default) into unsigned execution.
+LEASE_MODES = ("dual_signed",)
 _LEASE_KEYS = frozenset({"mode", "proposal_timeout_seconds"})
 
 

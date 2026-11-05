@@ -485,6 +485,16 @@ class Store:
                 )
             count += 1
         self._expire_negotiations_locked(now)
+        # A negotiation can only authorize execution while its lease is still
+        # active. Once the lease expires (or is completed/released) the stale
+        # ACTIVE row must not look like a live authorization, so it expires
+        # too -- restart/recovery therefore fails closed.
+        self.conn.execute(
+            "UPDATE lease_negotiations SET state='EXPIRED', updated_at=? "
+            "WHERE state='ACTIVE' AND lease_id NOT IN ("
+            "SELECT lease_id FROM leases WHERE status='active' AND expires_at > ?)",
+            (now, now),
+        )
         return count
 
     def expire_leases(self, now: str | None = None) -> int:
@@ -699,6 +709,11 @@ class Store:
                 self.conn.execute("UPDATE results SET status=? WHERE result_id=?", (ResultStatus.VALIDATED.value, result_id))
                 self.conn.execute("UPDATE task_shards SET status=?, output_hash=? WHERE task_id=?", ("completed", expected_hash, task.task_id))
                 self.conn.execute("UPDATE leases SET status=? WHERE lease_id=?", (LeaseStatus.RELEASED.value, result.lease_id))
+                self.conn.execute(
+                    "UPDATE lease_negotiations SET state='COMPLETED', updated_at=? "
+                    "WHERE lease_id=? AND state='ACTIVE'",
+                    (now, result.lease_id),
+                )
                 ensure_transition(task.status, TaskStatus.VALIDATED)
                 ensure_transition(TaskStatus.VALIDATED, TaskStatus.COMPLETED)
                 self.conn.execute(
@@ -729,6 +744,11 @@ class Store:
                 reasons.append("content hash mismatch")
             self.conn.execute("UPDATE results SET status=? WHERE result_id=?", (ResultStatus.REJECTED.value, result_id))
             self.conn.execute("UPDATE leases SET status=? WHERE lease_id=?", (LeaseStatus.RELEASED.value, result.lease_id))
+            self.conn.execute(
+                "UPDATE lease_negotiations SET state='FAILED', updated_at=? "
+                "WHERE lease_id=? AND state='ACTIVE'",
+                (now, result.lease_id),
+            )
             ensure_transition(task.status, TaskStatus.REJECTED)
             self.conn.execute(
                 "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
