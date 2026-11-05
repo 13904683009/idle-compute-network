@@ -1615,6 +1615,15 @@ class Node:
         else:
             logger.warning("result INVALID: %s", ack.body.get("reason"))
 
+    def _may_execute(self, lease_id: str) -> bool:
+        """D4 §8.2: a lease cancelled before execution must never run.
+
+        The worker only learns about cancellation through LEASE_CANCEL; the
+        check is applied after the commit is verified and immediately before
+        the single execution entry, so a cancel that arrives first wins.
+        """
+        return lease_id not in self._cancelled_leases
+
     def _claim_cycle_dual(self, coordinator: str) -> None:
         """D4: CLAIM_REQUEST -> LEASE_PROPOSE -> ACCEPT -> COMMIT -> execute."""
         claim_request_id = new_id("crq_")
@@ -1668,7 +1677,7 @@ class Node:
         except (LeaseError, InvalidTaskInput, ValueError, KeyError) as exc:
             logger.warning("lease negotiation rejected: %s", exc)
             return
-        if terms.lease_id in self._cancelled_leases:
+        if not self._may_execute(terms.lease_id):
             logger.warning("lease %s was cancelled before execution", terms.lease_id)
             return
         authorization = authorization_from_commit(commit, accepted, authority_node_id=coordinator)
