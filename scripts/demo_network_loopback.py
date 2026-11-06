@@ -1,7 +1,8 @@
 """Three-process loopback network demo: coordinator + worker + client.
 
 Single machine only. This is NOT D6 and NOT a cross-device validation: all
-processes share 127.0.0.1 and the same disk. It exercises the real wire path:
+processes run on the same host (127.0.0.1 by default, or a non-loopback local
+address with --host to exercise public-style binding). It exercises the real wire path:
 
   TASK_CREATE -> CLAIM_REQUEST -> LEASE_PROPOSE -> LEASE_ACCEPT ->
   LEASE_COMMIT -> execute -> SUBMIT -> validate -> CREDIT
@@ -57,15 +58,15 @@ def free_port() -> int:
     return port
 
 
-def wait_port(port: int, timeout: float = 30.0) -> None:
+def wait_port(host: str, port: int, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            with socket.create_connection((host, port), timeout=0.5):
                 return
         except OSError:
             time.sleep(0.1)
-    raise SystemExit(f"coordinator did not listen on 127.0.0.1:{port}")
+    raise SystemExit(f"coordinator did not listen on {host}:{port}")
 
 
 class Demo:
@@ -160,15 +161,23 @@ class Demo:
         return path
 
     def coordinator_config(
-        self, port: int, peers: list[str], cost: int, name: str
+        self,
+        port: int,
+        peers: list[str],
+        cost: int,
+        name: str,
+        *,
+        listen_host: str = "127.0.0.1",
+        allow_public_listen: bool = False,
     ) -> Path:
         return self.write_config(
             name,
             {
                 "role": "coordinator",
                 "transport": "tcp",
-                "listen_host": "127.0.0.1",
+                "listen_host": listen_host,
                 "listen_port": port,
+                "allow_public_listen": allow_public_listen,
                 "data_dir": str(self.root / "coord"),
                 "peers": peers,
                 "credits": {"task_cost": cost},
@@ -178,7 +187,7 @@ class Demo:
             },
         )
 
-    def worker_config(self, name: str, data_dir: Path, coord_port: int) -> Path:
+    def worker_config(self, name: str, data_dir: Path, coord_port: int, dial_host: str = "127.0.0.1") -> Path:
         return self.write_config(
             name,
             {
@@ -189,7 +198,7 @@ class Demo:
                 "data_dir": str(data_dir),
                 "peers": [self.coord.node_id],
                 "coordinator_node_id": self.coord.node_id,
-                "coordinator_addr": f"127.0.0.1:{coord_port}",
+                "coordinator_addr": f"{dial_host}:{coord_port}",
                 "capability": CAPABILITY,
                 "discovery": {"announce_interval_seconds": 5, "query_timeout_seconds": 5},
                 "poll_interval_seconds": 1,
@@ -198,7 +207,7 @@ class Demo:
             },
         )
 
-    def client_config(self, name: str, data_dir: Path, coord_port: int) -> Path:
+    def client_config(self, name: str, data_dir: Path, coord_port: int, dial_host: str = "127.0.0.1") -> Path:
         return self.write_config(
             name,
             {
@@ -209,7 +218,7 @@ class Demo:
                 "data_dir": str(data_dir),
                 "peers": [self.coord.node_id],
                 "coordinator_node_id": self.coord.node_id,
-                "coordinator_addr": f"127.0.0.1:{coord_port}",
+                "coordinator_addr": f"{dial_host}:{coord_port}",
                 "log_level": "INFO",
             },
         )
@@ -221,6 +230,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="three-process loopback network demo")
     parser.add_argument("--dir", default="var/demo-network", help="working directory")
     parser.add_argument("--reset", action="store_true", help="delete the working directory first")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="address workers/clients dial; use a LAN/public IP to exercise non-loopback",
+    )
     args = parser.parse_args()
 
     root = Path(args.dir).resolve()
@@ -228,7 +242,12 @@ def main() -> int:
         shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
 
-    print("NETWORK LOOPBACK DEMO (single machine, 127.0.0.1; NOT cross-device, NOT D6)")
+    dial_host = args.host
+    loopback = dial_host.lower() in ("127.0.0.1", "localhost", "::1") or dial_host.startswith("127.")
+    bind_host = "127.0.0.1" if loopback else "0.0.0.0"
+    allow_public = not loopback
+    mode = "LOOPBACK (127.0.0.1)" if loopback else f"PUBLIC-STYLE (bind {bind_host}, dial {dial_host})"
+    print(f"NETWORK DEMO - {mode}; single machine, NOT cross-device, NOT D6")
     demo = Demo(root)
     try:
         # ------------------------------------------------------------ free
@@ -236,12 +255,19 @@ def main() -> int:
         free_port_num = free_port()
         free_coord = demo.start(
             "coord-free",
-            demo.coordinator_config(free_port_num, [demo.worker.node_id, demo.client.node_id], 0, "free.json"),
+            demo.coordinator_config(
+                free_port_num,
+                [demo.worker.node_id, demo.client.node_id],
+                0,
+                "free.json",
+                listen_host=bind_host,
+                allow_public_listen=allow_public,
+            ),
         )
-        wait_port(free_port_num)
-        demo.start("worker-free", demo.worker_config("worker-free.json", root / "w", free_port_num))
+        wait_port(dial_host, free_port_num)
+        demo.start("worker-free", demo.worker_config("worker-free.json", root / "w", free_port_num, dial_host))
         time.sleep(2)
-        free_client_cfg = demo.client_config("client-free.json", root / "client", free_port_num)
+        free_client_cfg = demo.client_config("client-free.json", root / "client", free_port_num, dial_host)
         free_task = demo.create_task(free_client_cfg, "1,2,3")
         demo.wait_completed(free_client_cfg, free_task)
         demo.show_credit(demo.worker.node_id, "free path: worker earned CREDIT (no hold)")
@@ -253,18 +279,23 @@ def main() -> int:
         demo.start(
             "coord-paid",
             demo.coordinator_config(
-                paid_port_num, [demo.worker.node_id, demo.worker2.node_id], 1, "paid.json"
+                paid_port_num,
+                [demo.worker.node_id, demo.worker2.node_id],
+                1,
+                "paid.json",
+                listen_host=bind_host,
+                allow_public_listen=allow_public,
             ),
         )
-        wait_port(paid_port_num)
+        wait_port(dial_host, paid_port_num)
         # The client in this phase reuses the worker identity that earned the
         # credit above; its data_dir/seq continues, so replay protection holds.
-        paid_client_cfg = demo.client_config("client-paid.json", root / "w", paid_port_num)
+        paid_client_cfg = demo.client_config("client-paid.json", root / "w", paid_port_num, dial_host)
         # Create the paid task BEFORE starting the worker, so the HELD state is
         # observable; the worker then claims it through the normal network path.
         paid_task = demo.create_task(paid_client_cfg, "4,5")
         demo.show_credit(demo.worker.node_id, "paid path: available 0, held 1 before execution")
-        demo.start("worker-paid", demo.worker_config("worker-paid.json", root / "w2", paid_port_num))
+        demo.start("worker-paid", demo.worker_config("worker-paid.json", root / "w2", paid_port_num, dial_host))
         demo.wait_completed(paid_client_cfg, paid_task)
         demo.show_credit(demo.worker.node_id, "paid path: held 0, spent 1 after completion")
         db = root / "coord" / "coordinator.db"
@@ -294,7 +325,7 @@ def main() -> int:
     finally:
         demo.stop_all()
 
-    print("\nDemo finished: loopback only; D6 / real dual-device was NOT run.")
+    print(f"\nDemo finished: single-machine {mode}; D6 / real dual-device was NOT run.")
     return 0
 
 

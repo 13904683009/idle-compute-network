@@ -31,7 +31,7 @@ class NetworkDemoSmokeTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr[-3000:])
         out = result.stdout
-        self.assertIn("NETWORK LOOPBACK DEMO", out)
+        self.assertIn("NETWORK DEMO", out)
         self.assertIn("NOT cross-device", out)
         self.assertIn("TASK_CREATE", out)
         self.assertIn("final negotiation state=COMPLETED", out)

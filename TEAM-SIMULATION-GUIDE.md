@@ -1,4 +1,4 @@
-# 团队两台设备模拟指南（局域网）
+# 团队 / 公网双设备部署与模拟指南（公网推荐，局域网兼容）
 
 > 目标：两位团队成员在**各自真实设备**上，用同一份源码完成一次 coordinator + worker 的
 > 双签租约任务闭环，并留下可核对证据。
@@ -11,16 +11,18 @@
 
 ## 0. 安全须知（先读）
 
-- **只在可信局域网内测试**。coordinator 监听本机私网地址（如 `192.168.x.x` 或 `10.x.x.x`），
-  **不要**绑定公网地址、不要做路由器端口映射、不要开放公网入站。
-- **不要关闭防火墙**。只在本机为 coordinator 的 TCP 端口添加"仅专用/私有网络"的入站允许；
-  worker/client 不需要入站规则。
+- **产品推荐：Coordinator 公网可达**（云主机公网 IP，或路由器端口转发）。Coordinator 监听
+  `0.0.0.0`/公网 IP，并显式设置 `allow_public_listen: true`；Worker/Client 主动连接公网地址。
+- 只放行一个 TCP 测试端口；用防火墙/安全组限制来源。当前 TCP **没有 TLS**，公网部署建议
+  加 VPN/隧道/TLS 反向代理，不要无防护直接暴露端口。
+- **纯局域网模式仍支持**（`listen_host` 填私网 IP），但**不是产品默认**。
+- **中继/NAT 穿透尚未实现**；严格对称 NAT、无法端口映射的用户暂不可用。
 - **不要**在群里发送 `identity.key`、`.venv`、`var/` 下的数据库或任何私钥；节点身份文件
   只留在各自设备本地。
-- 配置里只需要交换 **node_id**（公开的 Ed25519 peer id）和 coordinator 的私网地址。
+- 配置里只需要交换 **node_id**（公开的 Ed25519 peer id）和 Coordinator 的公网地址
+  （局域网测试则为私网地址）。
 - 仅使用白名单任务 `numeric_batch_v1` 和测试数据（小整数列表）；不涉及真实资金、代币或链。
-  `credit_holds` 只在协调者本地记录任务价格；默认 `credits.task_cost=0`（免费），如需演示“积分换算力”，在 coordinator 配置中设置 `credits.task_cost>=1`（requester 需先有 CREDIT）。
-- 任何人要求"提供私钥/关闭防火墙/开放公网"都应拒绝并停止测试。
+- 任何人要求“提供私钥 / 关闭全部防火墙 / 无限制开放端口”都应拒绝并停止测试。
 
 ---
 
@@ -52,7 +54,7 @@ python -m unittest discover -s tests -q     # 期望 OK（479 项）
 
 | 设备 | 角色 | 职责 |
 | --- | --- | --- |
-| A | `coordinator` | 任务权威、租约仲裁、验证结果、记账；监听私网端口 |
+| A | `coordinator` | 任务权威、租约仲裁、验证结果、记账；监听公网/私网端口（显式授权） |
 | B | `worker` + `client` | worker 领取任务并执行；client 提交任务/查询状态 |
 
 当前架构**不需要**第三个设备：client 可与 worker 在同一台设备（不同 `data_dir`/config）。
@@ -83,7 +85,7 @@ python -m idle_compute identity --config var/team/client/node.json
 
 ## 4. 配置（设备 A 与 B）
 
-把 `<...>` 替换为实际 node_id；把 `<A_LAN_IP>` 替换为设备 A 的私网 IPv4。
+把 `<...>` 替换为实际 node_id；把 `<PUBLIC_HOST>` 替换为 Coordinator 的公网 IP/域名（局域网测试可填 `<A_LAN_IP>`）。
 
 ### 设备 A：`var/team/coord/node.json`
 
@@ -91,7 +93,7 @@ python -m idle_compute identity --config var/team/client/node.json
 {
   "role": "coordinator",
   "transport": "tcp",
-  "listen_host": "<A_LAN_IP>",
+  "listen_host": "0.0.0.0",
   "listen_port": 17700,
   "allow_public_listen": true,
   "data_dir": "var/team/coord",
@@ -102,9 +104,8 @@ python -m idle_compute identity --config var/team/client/node.json
 }
 ```
 
-`allow_public_listen: true` 只是因为 `listen_host` 不是回环地址（配置校验要求显式确认）；
-**它不代表允许公网**——请用防火墙把 17700 限制在私有网络，且 `listen_host` 填私网 IP 而
-不是 `0.0.0.0`。
+`allow_public_listen: true` 是公网监听所必需的显式授权。公网部署用 `0.0.0.0` + 端口转发/
+安全组；纯局域网可把 `listen_host` 改为私网 IP。无论哪种模式，都只放行测试端口并限制来源。
 
 ### 设备 B：`var/team/worker/node.json`
 
@@ -117,7 +118,7 @@ python -m idle_compute identity --config var/team/client/node.json
   "data_dir": "var/team/worker",
   "peers": ["<coordinator-node-id>"],
   "coordinator_node_id": "<coordinator-node-id>",
-  "coordinator_addr": "<A_LAN_IP>:17700",
+  "coordinator_addr": "<PUBLIC_HOST>:17700",
   "poll_interval_seconds": 1,
   "log_level": "INFO",
   "log_file": "var/team/worker/worker.log"
@@ -135,7 +136,7 @@ python -m idle_compute identity --config var/team/client/node.json
   "data_dir": "var/team/client",
   "peers": ["<coordinator-node-id>"],
   "coordinator_node_id": "<coordinator-node-id>",
-  "coordinator_addr": "<A_LAN_IP>:17700",
+  "coordinator_addr": "<PUBLIC_HOST>:17700",
   "log_level": "INFO"
 }
 ```
@@ -150,6 +151,14 @@ python -m idle_compute identity --config var/team/client/node.json
 不需要关闭系统防火墙。
 
 ---
+
+## 4a. 公网部署注意事项
+
+- Coordinator 必须有公网可达地址（云主机公网 IP / 端口映射）；Worker/Client 只需出站访问。
+- 防火墙/安全组只开放 Coordinator 的测试 TCP 端口；不要关闭全部防火墙。
+- 当前 TCP 没有传输层加密；公网长期运行建议 VPN/隧道/TLS 反向代理。
+- 中继/NAT 穿透未实现；严格对称 NAT 用户暂不可用。
+- 本指南仍**未在两台真实公网设备上执行过**；结果必须实测填写，不能用单机演示代替。
 
 ## 5. 启动顺序
 
@@ -220,7 +229,7 @@ python -c "import sqlite3,json;c=sqlite3.connect('var/team/coord/coordinator.db'
 | # | 判据 | 证据来源 | 结果（PASS/FAIL/PARTIAL） | 备注 |
 | --- | --- | --- | --- | --- |
 | 1 | 两台设备 commit/环境一致 | 第 1 节输出 |  |  |
-| 2 | 两机实际 TCP 通信（非 loopback） | worker 日志 `connected` + A 的私网 IP |  |  |
+| 2 | 两机实际 TCP 通信（非 loopback） | worker 日志 `connected` + A 的公网 IP/域名 |  |  |
 | 3 | worker 收到 coordinator 的 LEASE_PROPOSE | 设备 B 日志/DB 协商记录 |  |  |
 | 4 | 双签租约生效（ACCEPTED→ACTIVE→COMPLETED） | 第 6 节 SQL + 日志 |  |  |
 | 5 | worker 执行白名单任务 `numeric_batch_v1` | task/status 输出 |  |  |
@@ -252,7 +261,7 @@ python -c "import sqlite3,json;c=sqlite3.connect('var/team/coord/coordinator.db'
 
 | 现象 | 原因/处理 |
 | --- | --- |
-| `listen_host ... is not loopback: ... set allow_public_listen=true` | 设备 A 的 `listen_host` 是私网地址；确认是私网 IP 并加 `allow_public_listen: true`（勿开公网） |
+| `listen_host ... is not loopback: ... set allow_public_listen=true` | 设备 A 的 `listen_host` 是私网地址；确认是公网/私网 IP 并加 `allow_public_listen: true`；公网部署见 §4a |
 | `coordinator_node_id must be listed in peers` | worker/client 的 `peers` 缺少 coordinator id |
 | HELLO 被拒 / `BAD_SENDER` / `UNAUTHORIZED` | 双方 node_id 或 `peers` 填错；确认交换的是对方 `identity` 输出的 id |
 | 连接超时/拒绝 | A 的 IP/端口不对，或防火墙未放行 17700（仅私有网络） |
@@ -264,7 +273,7 @@ python -c "import sqlite3,json;c=sqlite3.connect('var/team/coord/coordinator.db'
 
 ## 10. 本指南**不**覆盖的内容
 
-- 公网、NAT 穿透、relay、DHT/mDNS（均未实现）。
+- NAT 穿透、relay、DHT/mDNS（未实现）；公网可达直连已支持（见 §4a）。
 - 真实断线重连/进程重启恢复的自动验证（D4 仍有 NOT TESTED 项，见 `D4-ACCEPTANCE-MATRIX.md`）。
 - 能力公告/匹配器参与调度、D5 注册表参与调度（注册表已接入节点与 matcher 的
   registry-first 校验，但仍是本地模拟、非链上/共识；不得声称链上注册或跨设备共识）。

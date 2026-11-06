@@ -1,6 +1,6 @@
 # Idle Compute Network
 
-一个**本地可测试、协调者仲裁**的闲置算力网络 MVP。目前在单机/局域网内可以完成：
+一个**本地可测试、协调者仲裁**的闲置算力网络 MVP。目前在单机，或 coordinator 公网可达时，可以完成：
 能力公告、匹配、**双方签名的任务租约**、白名单任务执行、独立结果验证与内部积分账本。
 
 - 任务权威：协调者（coordinator）是唯一任务权威；当前**不是**去中心化调度。
@@ -17,7 +17,8 @@
 | 测试 | **479 项**标准库 unittest，全部通过（`python -m unittest discover -s tests -v`） |
 | 真实双设备（D6） | **未执行**；文档与测试仅覆盖单机多进程 |
 | 链上注册表 / 共识 / 代币 | **未实现**；`LocalRegistryAdapter` 只是本地 SQLite 模拟，已接入节点告示与 matcher 的 registry-first 校验，**不是**链上/共识 |
-| 公网 / NAT 穿透 / relay / DHT / mDNS | **未实现**；仅支持可路由的局域网直连 |
+| 公网可达部署 | **支持（产品推荐）**：coordinator 监听 `0.0.0.0`/公网 IP（`allow_public_listen=true`），worker/client 主动连接公网地址；单机已用非 loopback 地址跑通全流程 |
+| NAT 穿透 / relay / DHT / mDNS | **未实现**；严格对称 NAT 用户暂不可用（无中继）；纯局域网仍支持 |
 | 生产就绪 | **否**；未做安全审计与负载测试 |
 
 ## 环境要求
@@ -105,9 +106,44 @@ python -m idle_compute node status --config var/quick/client/node.json --task-id
 成功时 `node status` 返回 `"status": "COMPLETED"`、`"validation": "VALID"`、`"credits_count": 1`。
 `peers add` 可辅助维护 peers/directory（`python -m idle_compute peers add <node_id> --role worker --config ...`）。
 
+## 公网部署（产品推荐模式）
+
+Worker/Client 只要能上网即可主动连接 Coordinator，不需要与 Coordinator 同一局域网。
+Coordinator 需要有公网可达地址：云主机公网 IP，或路由器端口转发到内网机器。
+
+Coordinator 配置（`var/prod/coord/node.json`）：
+
+```json
+{
+  "role": "coordinator",
+  "transport": "tcp",
+  "listen_host": "0.0.0.0",
+  "listen_port": 17700,
+  "allow_public_listen": true,
+  "data_dir": "var/prod/coord",
+  "peers": ["<worker-node-id>", "<client-node-id>"],
+  "credits": {"task_cost": 0}
+}
+```
+
+Worker/Client 配置把 `coordinator_addr` 指向 Coordinator 的公网地址：
+
+```json
+{"coordinator_addr": "<PUBLIC_IP_OR_DOMAIN>:17700"}
+```
+
+要点：
+
+- `allow_public_listen: true` 是显式授权；监听非 loopback 地址必须设置它。
+- 防火墙/安全组只放行 `<PORT>/TCP`；peer 白名单仍需提前交换 node_id，未列入的 HELLO 会被拒绝。
+- 当前 TCP 传输**没有 TLS**；公网部署建议加 VPN/隧道/TLS 反向代理，不要无防护直接暴露。
+- **纯局域网模式仍支持**（`listen_host` 填私网 IP，`allow_public_listen` 按需），但**不是产品默认**。
+- **中继/NAT 穿透尚未实现**：严格对称 NAT、无法做端口映射的用户暂不可用。
+- 尚未完成真实跨公网双设备验证；不要把单机非 loopback 演示当作跨设备结果（见 `D6-DESIGN.md`）。
+
 ## 两台设备 / 团队模拟
 
-见 **[TEAM-SIMULATION-GUIDE.md](TEAM-SIMULATION-GUIDE.md)**：局域网地址、防火墙、启动顺序、
+见 **[TEAM-SIMULATION-GUIDE.md](TEAM-SIMULATION-GUIDE.md)**：公网/局域网地址、防火墙、启动顺序、
 证据采集表、PASS/FAIL 判据、清理与常见故障。**当前尚未在两台真实设备上执行**，
 指南中的跨设备结果必须由团队实测填写，不能引用 loopback 结果。
 

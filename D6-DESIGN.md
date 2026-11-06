@@ -7,11 +7,12 @@
 
 ## 1. 目标与非目标
 
-**目标**：两台物理设备（A=coordinator，B=worker/client）在局域网内完成一次可复现的
-双签租约任务闭环，并留下可核对证据（发现、匹配、提议、接受、commit、执行、验证、单次 CREDIT）。
+**目标**：两台物理设备（A=Coordinator，有公网可达地址；B=worker/client，只要能上网）
+跨公网完成一次可复现的双签租约任务闭环，并留下可核对证据（发现、匹配、提议、接受、commit、
+执行、验证、单次 CREDIT）。**本文件不代表已经执行过该测试。**
 
 **非目标**（明确不做，也不宣称）：
-- 公网 / NAT 穿透 / relay / DHT / mDNS；
+- NAT 穿透 / relay / DHT / mDNS（**公网可达直连是支持的**，但严格对称 NAT 无中继不可用）；
 - 自动断线重连或“断线可恢复”；
 - 多 coordinator / 去中心化调度 / 链上注册表 / 代币支付；
 - 跨设备性能基准（D5 的 loopback 数字不代表跨设备）。
@@ -19,23 +20,24 @@
 ## 2. 拓扑与角色
 
 ```
-设备 A（LAN IP: <A_LAN_IP>）
-  coordinator  node run   listen_host=<A_LAN_IP>:<PORT>  allow_public_listen=true（仅私网）
-设备 B
-  worker       node run   coordinator_addr=<A_LAN_IP>:<PORT>（仅出站）
+设备 A（公网 IP/域名 <PUBLIC_HOST>，云主机或端口转发）
+  coordinator  node run   listen_host=0.0.0.0:<PORT>  allow_public_listen=true
+设备 B（只要能上网，主动出站）
+  worker       node run   coordinator_addr=<PUBLIC_HOST>:<PORT>
   client       node create-task / node status（可与 worker 同机）
 ```
 
 传输：`transport=tcp`（libp2p 传输亦可，但 D6 第一轮只验 TCP）。
-防火墙：仅设备 A 的专用网络放行 `<PORT>` TCP；不开放公网、不关闭防火墙。
+网络：安全组/防火墙只放行 `<PORT>/TCP`；优先限制来源 IP。当前 TCP 没有 TLS，
+长期公网运行建议 VPN/隧道/TLS 反向代理。中继/NAT 穿透未实现，严格对称 NAT 用户不可用。
 
 ## 3. 前置条件（检查表）
 
 - [ ] 两机 `git rev-parse HEAD` 相同（当前发布版本）
 - [ ] 两机 Python 3.11+，`pip install -r requirements.txt` 成功
 - [ ] 两机 `python -m unittest discover -s tests -q` 全绿
-- [ ] 两机时钟大致同步（NTP 或手动；D4 租约有效期依赖本机时钟）
-- [ ] A 的私网 IP 已知；B 能 `ping`/`Test-NetConnection <A_LAN_IP> <PORT>`
+- [ ] 两机时钟大致同步（NTP 或手动；D4 租约有效期依赖本机时钟）；记录跨机偏差
+- [ ] A 的公网 IP/域名与端口转发已配置；B 能 `Test-NetConnection <PUBLIC_HOST> <PORT>`
 - [ ] 两边都只交换 node_id（公钥标识）；**不交换 identity.key**
 - [ ] coordinator `peers` 含 worker+client id；worker/client `peers` 含 coordinator id
 - [ ] coordinator 配置 `credits.task_cost` 明确（0 或 ≥1；若 ≥1，requester 需先有 CREDIT）
@@ -102,7 +104,7 @@
 | 项 | 状态 |
 | --- | --- |
 | 时钟偏差（两机） | **待验证**；租约/公告/commit 均依赖本机时钟 |
-| 防火墙/NAT/路由 | **待验证**；仅支持可路由私网 |
+| 防火墙/NAT/路由 | **待验证**；公网直连推荐，严格对称 NAT 无中继不可用 |
 | 断线自动恢复 | **未实现**；只保证 fail-closed（C5 最小语义） |
 | 注册表跨节点一致性 | **未实现**；D5 注册表是本地模拟 |
 | 性能/带宽 | **未验证**；loopback 数据不外推 |

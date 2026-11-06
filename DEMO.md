@@ -44,9 +44,12 @@ python -m idle_compute credit --db var/demo/idle.db --peer <peer>
 
 ```bash
 python scripts/demo_network_loopback.py --dir var/demo-network --reset
+# 模拟公网部署形态：coordinator 绑 0.0.0.0，worker/client 拨非 loopback 本机地址
+python scripts/demo_network_loopback.py --dir var/demo-network --reset --host <LAN_IP>
 ```
 
-脚本在**同一台机器、127.0.0.1** 启动真实进程并走完整 wire 路径：
+脚本在**同一台机器**启动真实进程并走完整 wire 路径；默认 127.0.0.1，`--host <LAN_IP>`
+会以 `0.0.0.0` 监听并用非 loopback 地址连接（模拟“公网可达 Coordinator”的部署形态）：
 
 1. **免费路径**：coordinator（`credits.task_cost=0`）+ worker + client；
    `node create-task` → `TASK_CREATE_ACK` → claim → `LEASE_PROPOSE` → `LEASE_ACCEPT`
@@ -79,6 +82,19 @@ python scripts/demo_network_loopback.py --dir var/demo-network --reset
 > **范围**：单机 loopback / 127.0.0.1；**非跨设备、非 D6**。它验证真实三进程 wire 路径，
 > 但没有验证两台物理设备、防火墙、NAT、时钟偏差或断线恢复，不能作为 D6 证据。
 > 日志在 `var/demo-network/*.log`；失败时脚本会终止所有子进程。
+
+### 公网部署配置示意
+
+真实公网部署只需把 Coordinator 监听改为 `0.0.0.0` 并显式授权，Worker/Client 填公网地址：
+
+```json
+// coordinator
+{"listen_host": "0.0.0.0", "listen_port": 17700, "allow_public_listen": true}
+// worker / client
+{"coordinator_addr": "<PUBLIC_IP_OR_DOMAIN>:17700"}
+```
+
+本演示仅在本机用非 loopback 地址模拟，**不是**真实跨公网验证；NAT 穿透/relay 未实现。
 
 ## 2. 手动免费路径（只用 Phase-1 CLI）
 

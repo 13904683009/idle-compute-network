@@ -73,3 +73,21 @@
 | | `max_announcement_ttl_seconds` | 120 | 本地允许的最长公告有效期（钳制远端时间） |
 | | `offline_after_seconds` | 90 | 多久没活动标记为不可达（必须 > 公告间隔） |
 | | `query_timeout_seconds` | 10 | 定向查询超时 |
+
+## 公网部署配置（产品推荐）
+
+```json
+{
+  "role": "coordinator",
+  "transport": "tcp",
+  "listen_host": "0.0.0.0",
+  "listen_port": 17700,
+  "allow_public_listen": true,
+  "peers": ["<worker-node-id>", "<client-node-id>"]
+}
+```
+
+- Worker/Client 的 `coordinator_addr` 填 `<PUBLIC_IP_OR_DOMAIN>:17700`。
+- `allow_public_listen` 默认 false；监听任何非 loopback 地址都必须显式设为 true。
+- 纯局域网仍支持：`listen_host` 填私网 IP；不是产品默认。
+- NAT 穿透/relay 未实现；严格对称 NAT 用户不可用。
