@@ -91,3 +91,20 @@
 - `allow_public_listen` 默认 false；监听任何非 loopback 地址都必须显式设为 true。
 - 纯局域网仍支持：`listen_host` 填私网 IP；不是产品默认。
 - NAT 穿透/relay 未实现；严格对称 NAT 用户不可用。
+
+### TLS（公网必须）
+
+Coordinator：
+
+```json
+{"tls": {"cert_file": "certs/server.crt", "key_file": "certs/server.key"}}
+```
+
+Worker/Client：
+
+```json
+{"tls": {"ca_file": "certs/server.crt", "server_hostname": "coordinator.example.com"}}
+```
+
+- 仅 `transport: "tcp"` 支持；省略 `tls` 保持明文（仅本地/兼容）。
+- 客户端始终验证证书与主机名；证书 SAN 必须匹配 `server_hostname`/连接地址。

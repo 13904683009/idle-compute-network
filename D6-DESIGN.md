@@ -29,7 +29,7 @@
 
 传输：`transport=tcp`（libp2p 传输亦可，但 D6 第一轮只验 TCP）。
 网络：安全组/防火墙只放行 `<PORT>/TCP`；优先限制来源 IP。当前 TCP 没有 TLS，
-长期公网运行建议 VPN/隧道/TLS 反向代理。中继/NAT 穿透未实现，严格对称 NAT 用户不可用。
+公网 D6 **必须启用 TLS**（cert/key + ca_file/主机名校验）或外层 VPN/TLS 隧道；中继/NAT 穿透未实现，严格对称 NAT 用户不可用。
 
 ## 3. 前置条件（检查表）
 
@@ -41,6 +41,7 @@
 - [ ] 两边都只交换 node_id（公钥标识）；**不交换 identity.key**
 - [ ] coordinator `peers` 含 worker+client id；worker/client `peers` 含 coordinator id
 - [ ] coordinator 配置 `credits.task_cost` 明确（0 或 ≥1；若 ≥1，requester 需先有 CREDIT）
+- [ ] 公网路径已配置 TLS（cert/key；客户端 ca_file/主机名），或外层 VPN/TLS 隧道
 
 ## 4. 执行步骤（D6 时由团队执行，本轮不执行）
 
@@ -155,7 +156,7 @@ python scripts/d6_preflight.py --json --out var/d6/preflight-<device>.json
 ## 11. D6 通过所需的最小证据集
 
 所有时间必须为 **UTC ISO-8601**；所有文件放在 `var/d6/evidence-<device>-<timestamp>/`
-（不提交仓库）。**E1–E12 缺一不可**，缺任何一项即判 NOT PASS。
+（不提交仓库）。**E1–E13 缺一不可**，缺任何一项即判 NOT PASS。
 
 | ID | 证据 | 采集方式 | 通过条件 |
 | --- | --- | --- | --- |
@@ -170,7 +171,8 @@ python scripts/d6_preflight.py --json --out var/d6/preflight-<device>.json
 | E9 | CREDIT 结算 | A 上 `SELECT COUNT(*) FROM credit_events WHERE task_id=?`；`credit --peer <requester>` 前后输出 | 该任务恰好 1 条 CREDIT；requester `held` 1→0、`spent` 0→1；worker earned +1 |
 | E10 | 时钟偏差 | 两机 D6 前后各记录一次 UTC 与本地偏移；可用 NTP/`w32tm` 参考 | 记录 A/B 偏差；建议 |skew| ≤ 2 s，且必须小于租约窗口的安全余量 |
 | E11 | 负向 fail-closed | 无 commit、取消/过期、错投/广播、worker 重启各一次 | 四类场景均未执行；有日志/DB 证据；不把 C5 当自动恢复 |
-| E12 | 清理与保密 | 证据目录清单；确认无 identity.key/ledger.key/私钥/DB 入库 | 只提交文档/脱敏日志；`PROJECT-STATUS-AND-HANDOFF.md` 不入库 |
+| E12 | TLS（公网必填） | 证书 SAN、双方 `tls` 配置、握手成功日志；负向：错误 CA/主机名被拒 | 公网部署必须 TLS；单机 loopback 可明文 |
+| E13 | 清理与保密 | 证据目录清单；确认无 identity.key/ledger.key/私钥/DB 入库 | 只提交文档/脱敏日志；`PROJECT-STATUS-AND-HANDOFF.md` 不入库 |
 
 ### 11.1 建议的最小 SQL
 

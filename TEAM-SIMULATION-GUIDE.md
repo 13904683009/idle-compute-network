@@ -156,7 +156,13 @@ python -m idle_compute identity --config var/team/client/node.json
 
 - Coordinator 必须有公网可达地址（云主机公网 IP / 端口映射）；Worker/Client 只需出站访问。
 - 防火墙/安全组只开放 Coordinator 的测试 TCP 端口；不要关闭全部防火墙。
-- 当前 TCP 没有传输层加密；公网长期运行建议 VPN/隧道/TLS 反向代理。
+- **公网 TLS 必须开启**。Coordinator：`"tls": {"cert_file": "...", "key_file": "..."}`；
+  Worker/Client：`"tls": {"ca_file": "...", "server_hostname": "<证书 SAN>"}`。
+  自签证书需把公网域名/IP 写入 SAN；客户端会验证证书与主机名。
+- 生成示例：`openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout server.key -out server.crt`
+  `-subj "/CN=<PUBLIC_HOST>" -addext "subjectAltName=DNS:<PUBLIC_HOST>,IP:<PUBLIC_IP>"`。
+- 未配置 `tls` 的明文仅用于单机/局域网兼容；**公网部署不得明文暴露**。
+
 - 中继/NAT 穿透未实现；严格对称 NAT 用户暂不可用。
 - 本指南仍**未在两台真实公网设备上执行过**；结果必须实测填写，不能用单机演示代替。
 

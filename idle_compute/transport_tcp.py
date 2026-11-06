@@ -49,9 +49,11 @@ connection cannot interleave the bytes of two frames.
 
 from __future__ import annotations
 
+import logging
 import socket
+import ssl
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .net_transport import (
     NetTransport,
@@ -71,7 +73,10 @@ __all__ = [
 # the serve thread gives up on a half-open peer (see module docstring).
 _READ_WRITE_TIMEOUT_SECONDS = 300.0
 _CONNECT_TIMEOUT_SECONDS = 10.0
+_TLS_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 _ACCEPT_BACKLOG = 16
+
+logger = logging.getLogger(__name__)
 
 # handler(peer_id, read, write); read(n) -> bytes, write(data) -> None
 _StreamHandler = Callable[[str, Callable[[int], bytes], Callable[[bytes], None]], None]
@@ -130,6 +135,7 @@ class TcpTransport(NetTransport):
         peer_id: str,
         listen_host: str = "127.0.0.1",
         listen_port: int = 0,
+        tls: Any | None = None,
     ) -> None:
         if not isinstance(peer_id, str) or not peer_id:
             raise ValueError("peer_id must be a non-empty string")
@@ -138,6 +144,9 @@ class TcpTransport(NetTransport):
         self._peer_id = peer_id
         self._listen_host = listen_host
         self._listen_port = listen_port
+        self._tls = tls
+        self._server_context: ssl.SSLContext | None = None
+        self._client_context: ssl.SSLContext | None = None
         self._lock = threading.RLock()
         self._listener: Optional[socket.socket] = None
         self._bound_port: Optional[int] = None
@@ -172,6 +181,8 @@ class TcpTransport(NetTransport):
                 raise TransportError(
                     f"{self._peer_id}: start() called twice without stop()"
                 )
+            if self._tls is not None and getattr(self._tls, "cert_file", None):
+                self._server_context = self._build_server_context()
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -246,6 +257,15 @@ class TcpTransport(NetTransport):
             try:
                 sock.settimeout(_CONNECT_TIMEOUT_SECONDS)
                 sock.connect((host, port))
+                if self._tls is not None:
+                    try:
+                        context = self._client_tls_context()
+                        server_hostname = getattr(self._tls, "server_hostname", None) or host
+                        sock = context.wrap_socket(sock, server_hostname=server_hostname)
+                    except (ssl.SSLError, OSError, ValueError, TransportError) as exc:
+                        failures.append(f"{addr}: TLS {exc}")
+                        _quiet_close(sock)
+                        continue
             except OSError as exc:
                 failures.append(f"{addr}: {exc}")
                 _quiet_close(sock)
@@ -304,6 +324,42 @@ class TcpTransport(NetTransport):
 
     # -- internals -------------------------------------------------------
 
+    # -- TLS helpers -----------------------------------------------------
+
+    def _build_server_context(self) -> ssl.SSLContext:
+        cert = getattr(self._tls, "cert_file", None)
+        key = getattr(self._tls, "key_file", None)
+        if not cert or not key:
+            raise TransportError(f"{self._peer_id}: TLS server requires cert_file and key_file")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            context.load_cert_chain(certfile=cert, keyfile=key)
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            raise TransportError(
+                f"{self._peer_id}: cannot load TLS cert/key: {exc}"
+            ) from exc
+        return context
+
+    def _client_tls_context(self) -> ssl.SSLContext:
+        if self._client_context is None:
+            ca_file = getattr(self._tls, "ca_file", None)
+            try:
+                context = (
+                    ssl.create_default_context(cafile=ca_file)
+                    if ca_file
+                    else ssl.create_default_context()
+                )
+            except (OSError, ssl.SSLError) as exc:
+                raise TransportError(
+                    f"{self._peer_id}: cannot load TLS CA file: {exc}"
+                ) from exc
+            context.check_hostname = True
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            self._client_context = context
+        return self._client_context
+
     def _accept_loop(self) -> None:
         listener = self._listener
         if listener is None:
@@ -320,6 +376,17 @@ class TcpTransport(NetTransport):
             if handler is None or stopped or over_limit:
                 _quiet_close(sock)
                 continue
+            if self._tls is not None:
+                if self._server_context is None:
+                    _quiet_close(sock)
+                    continue
+                try:
+                    sock.settimeout(_TLS_HANDSHAKE_TIMEOUT_SECONDS)
+                    sock = self._server_context.wrap_socket(sock, server_side=True)
+                except (ssl.SSLError, OSError) as exc:
+                    logger.warning("TLS handshake failed from %s: %s", remote, exc)
+                    _quiet_close(sock)
+                    continue
             # Placeholder peer id by design (WAVE 1): the transport relays
             # bytes only; HELLO-first identity binding is the node layer's job.
             peer_id = f"tcp:{remote[0]}:{remote[1]}"
@@ -347,8 +414,8 @@ class TcpTransport(NetTransport):
             # read=conn.recv may return fewer bytes than asked and returns
             # b"" when the peer closed; write is the locked sendall.
             handler(conn.peer_id, sock.recv, conn.write)
-        except OSError:
-            pass  # peer vanished or stop() closed us: exit quietly
+        except OSError as exc:
+            logger.debug("stream %s ended: %s", conn.peer_id, exc)
         finally:
             with self._lock:
                 self._live.discard(sock)

@@ -222,7 +222,7 @@ class Node:
         # Transports.
         if config.transport == "tcp":
             self.transport: NetTransport = TcpTransport(
-                self.identity.node_id, config.listen_host, config.listen_port
+                self.identity.node_id, config.listen_host, config.listen_port, tls=config.tls
             )
         else:
             self.transport = Libp2pTransport(

@@ -79,6 +79,7 @@ _DEFAULTS = {
     "discovery": {},
     "credits": {},
     "lease": {},
+    "tls": None,
     "coordinator_node_id": None,
     "coordinator_addr": None,
     "poll_interval_seconds": 5,
@@ -135,6 +136,58 @@ class CreditsConfig:
     """CREDIT-for-compute price per task; 0 keeps the historic free path."""
 
     task_cost: int = 0
+
+
+@dataclass(frozen=True)
+class TlsConfig:
+    """Optional TLS settings for the TCP transport.
+
+    - Server (coordinator): ``cert_file`` + ``key_file`` are required.
+    - Client (worker/client): ``ca_file`` is optional (system roots otherwise),
+      ``server_hostname`` overrides certificate hostname verification.
+    - Omitting the whole section keeps plaintext (backward compatible).
+    """
+
+    cert_file: str | None = None
+    key_file: str | None = None
+    ca_file: str | None = None
+    server_hostname: str | None = None
+
+
+_TLS_KEYS = frozenset({"cert_file", "key_file", "ca_file", "server_hostname"})
+
+
+def _parse_tls(value: Any) -> TlsConfig | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError(f"tls must be an object or null, got {type(value).__name__}")
+    unknown = sorted(str(key) for key in value if key not in _TLS_KEYS)
+    if unknown:
+        raise ValidationError(f"tls has unknown key(s): {', '.join(unknown)}")
+
+    def optional_str(key: str) -> str | None:
+        raw_value = value.get(key)
+        if raw_value is None:
+            return None
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            raise ValidationError(f"tls.{key} must be a non-empty string or null")
+        return raw_value
+
+    cert_file = optional_str("cert_file")
+    key_file = optional_str("key_file")
+    ca_file = optional_str("ca_file")
+    server_hostname = optional_str("server_hostname")
+    if bool(cert_file) != bool(key_file):
+        raise ValidationError("tls.cert_file and tls.key_file must be set together")
+    if not any((cert_file, key_file, ca_file, server_hostname)):
+        raise ValidationError("tls section is empty; omit it for plaintext")
+    return TlsConfig(
+        cert_file=cert_file,
+        key_file=key_file,
+        ca_file=ca_file,
+        server_hostname=server_hostname,
+    )
 
 
 _CREDITS_KEYS = frozenset({"task_cost"})
@@ -508,6 +561,12 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
     discovery = _parse_discovery(raw.get("discovery", _DEFAULTS["discovery"]))
     lease = _parse_lease(raw.get("lease", _DEFAULTS["lease"]))
     credits = _parse_credits(raw.get("credits", _DEFAULTS["credits"]))
+    tls = _parse_tls(raw.get("tls"))
+    if tls is not None:
+        if transport != "tcp":
+            raise ValidationError("tls is only supported with transport='tcp'")
+        if role == "coordinator" and not (tls.cert_file and tls.key_file):
+            raise ValidationError("coordinator tls requires cert_file and key_file")
 
     return NodeConfig(
         node_id=node_id,
@@ -524,6 +583,7 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
         discovery=discovery,
         lease=lease,
         credits=credits,
+        tls=tls,
         coordinator_node_id=coordinator_node_id,
         coordinator_addr=coordinator_addr,
         poll_interval_seconds=poll_interval_seconds,
@@ -578,6 +638,7 @@ class NodeConfig:
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
     credits: CreditsConfig = field(default_factory=CreditsConfig)
+    tls: TlsConfig | None = None
     coordinator_node_id: str | None = None
     coordinator_addr: str | None = None
     poll_interval_seconds: int = 5
@@ -591,7 +652,7 @@ class NodeConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize back to schema form; ``from_dict`` roundtrips it."""
-        return {
+        data = {
             "node_id": self.node_id,
             "role": self.role,
             "transport": self.transport,
@@ -628,3 +689,11 @@ class NodeConfig:
             "log_level": self.log_level,
             "log_file": self.log_file,
         }
+        if self.tls is not None:
+            data["tls"] = {
+                "cert_file": self.tls.cert_file,
+                "key_file": self.tls.key_file,
+                "ca_file": self.tls.ca_file,
+                "server_hostname": self.tls.server_hostname,
+            }
+        return data

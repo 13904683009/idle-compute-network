@@ -18,6 +18,7 @@
 | 真实双设备（D6） | **未执行**；文档与测试仅覆盖单机多进程 |
 | 链上注册表 / 共识 / 代币 | **未实现**；`LocalRegistryAdapter` 只是本地 SQLite 模拟，已接入节点告示与 matcher 的 registry-first 校验，**不是**链上/共识 |
 | 公网可达部署 | **支持（产品推荐）**：coordinator 监听 `0.0.0.0`/公网 IP（`allow_public_listen=true`），worker/client 主动连接公网地址；单机已用非 loopback 地址跑通全流程 |
+| TCP TLS | **可选**：coordinator 配 `cert_file`/`key_file`，worker/client 用 `ca_file` 校验服务端；默认明文仅用于本地/兼容，公网部署必须开启 |
 | NAT 穿透 / relay / DHT / mDNS | **未实现**；严格对称 NAT 用户暂不可用（无中继）；纯局域网仍支持 |
 | 生产就绪 | **否**；未做安全审计与负载测试 |
 
@@ -136,10 +137,42 @@ Worker/Client 配置把 `coordinator_addr` 指向 Coordinator 的公网地址：
 
 - `allow_public_listen: true` 是显式授权；监听非 loopback 地址必须设置它。
 - 防火墙/安全组只放行 `<PORT>/TCP`；peer 白名单仍需提前交换 node_id，未列入的 HELLO 会被拒绝。
-- 当前 TCP 传输**没有 TLS**；公网部署建议加 VPN/隧道/TLS 反向代理，不要无防护直接暴露。
+- **公网部署必须开启 TLS**（默认明文仅为本地/向后兼容）。配置见下方“公网 TLS”；也可在外层使用 VPN/隧道/TLS 反向代理。
 - **纯局域网模式仍支持**（`listen_host` 填私网 IP，`allow_public_listen` 按需），但**不是产品默认**。
 - **中继/NAT 穿透尚未实现**：严格对称 NAT、无法做端口映射的用户暂不可用。
 - 尚未完成真实跨公网双设备验证；不要把单机非 loopback 演示当作跨设备结果（见 `D6-DESIGN.md`）。
+
+### 公网 TLS（公网部署必须开启）
+
+Coordinator（服务端证书/私钥）：
+
+```json
+"tls": {
+  "cert_file": "certs/server.crt",
+  "key_file": "certs/server.key"
+}
+```
+
+Worker/Client（校验服务端证书；`server_hostname` 必须匹配证书 SAN）：
+
+```json
+"tls": {
+  "ca_file": "certs/server.crt",
+  "server_hostname": "coordinator.example.com"
+}
+```
+
+自签证书示例（把 DNS/IP 换成你的真实地址；IP 必须写入 SAN）：
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 365   -keyout certs/server.key -out certs/server.crt   -subj "/CN=coordinator.example.com"   -addext "subjectAltName=DNS:coordinator.example.com,IP:203.0.113.10"
+```
+
+- 双方都必须配置 `tls`；一方 TLS、另一方明文会握手失败并被拒绝。
+- 客户端始终验证证书与主机名（`CERT_REQUIRED` + `check_hostname`）。
+- 不配置 `tls` 时保持明文，仅用于单机/局域网兼容；**公网不得明文暴露**。
+- TLS 只保护传输层；节点身份仍由现有 Ed25519 双签/租约机制保证。
 
 ## 两台设备 / 团队模拟
 
