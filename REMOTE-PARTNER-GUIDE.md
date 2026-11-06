@@ -76,6 +76,28 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -addext "subjectAltName=DNS:<PUBLIC_HOST>,IP:<PUBLIC_IP>"
 ```
 
+### 4a. 用脚本生成（推荐，支持域名 + IP SAN）
+
+```bash
+python scripts/setup_public_certs.py \
+  --host <PUBLIC_HOST> --ip <PUBLIC_IP> --out-dir certs
+```
+
+- `--host` 可填域名或 IP；`--ip` 可重复，追加额外 IP SAN；
+- `--json` 输出机器可读结果；`--force` 覆盖已有文件；`--days` 设置有效期（1..3650）；
+- 文件不存在交互终端时也可用 `--interactive` 按提示输入；
+- 输出会直接打印三端可粘贴的配置：
+
+```text
+Coordinator config:
+  {"cert_file": "/repo/certs/server.crt", "key_file": "/repo/certs/server.key"}
+Worker/Client config:
+  {"ca_file": "/repo/certs/server.crt", "server_hostname": "<PUBLIC_HOST>"}
+```
+
+自签场景下 `server.crt` 同时作为客户端的 `ca_file`；`server_hostname` 必须与 SAN
+中的域名/IP 一致。脚本只生成文件，不做任何网络或跨公网验证。
+
 把 `certs/server.crt` 通过安全渠道发给 Worker/Client 作为 `ca_file`（自签场景）。检查 SAN：
 
 ```bash
