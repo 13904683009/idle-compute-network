@@ -1,0 +1,19 @@
+{
+  "role": "coordinator",
+  "transport": "tcp",
+  "listen_host": "0.0.0.0",
+  "listen_port": 17700,
+  "allow_public_listen": true,
+  "data_dir": "var/remote/coordinator",
+  "peers": ["<WORKER_NODE_ID>", "<CLIENT_NODE_ID>"],
+  "credits": {
+    "task_cost": 0
+  },
+  "tls": {
+    "cert_file": "certs/server.crt",
+    "key_file": "certs/server.key"
+  },
+  "poll_interval_seconds": 1,
+  "log_level": "INFO",
+  "log_file": "var/remote/coordinator/coordinator.log"
+}

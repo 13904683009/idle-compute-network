@@ -1,0 +1,15 @@
+{
+  "role": "client",
+  "transport": "tcp",
+  "listen_host": "127.0.0.1",
+  "listen_port": 0,
+  "data_dir": "var/remote/client",
+  "peers": ["<COORDINATOR_NODE_ID>"],
+  "coordinator_node_id": "<COORDINATOR_NODE_ID>",
+  "coordinator_addr": "<PUBLIC_HOST>:17700",
+  "tls": {
+    "ca_file": "certs/server.crt",
+    "server_hostname": "<PUBLIC_HOST>"
+  },
+  "log_level": "INFO"
+}

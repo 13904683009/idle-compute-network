@@ -1,0 +1,51 @@
+{
+  "role": "worker",
+  "transport": "tcp",
+  "listen_host": "127.0.0.1",
+  "listen_port": 0,
+  "data_dir": "var/remote/worker",
+  "peers": ["<COORDINATOR_NODE_ID>"],
+  "coordinator_node_id": "<COORDINATOR_NODE_ID>",
+  "coordinator_addr": "<PUBLIC_HOST>:17700",
+  "capability": {
+    "capability_version": 1,
+    "ttl_seconds": 3600,
+    "supported_task_types": ["numeric_batch_v1"],
+    "supported_runtimes": ["python_sandbox_v1"],
+    "hardware": {
+      "cpu_arch": "x86_64",
+      "cpu_cores": 8,
+      "ram_mb": 16384
+    },
+    "resource_limits": {
+      "max_cpu_cores": 4,
+      "max_ram_mb": 8192,
+      "max_gpu_memory_mb": 0,
+      "max_task_duration_seconds": 600
+    },
+    "network": {
+      "supported_transports": ["tcp"],
+      "supports_relay": false
+    },
+    "verification": {
+      "level": "SELF_DECLARED",
+      "benchmark_profile": null
+    },
+    "available_resources": {
+      "cpu_cores": 4,
+      "ram_mb": 8192,
+      "gpu_memory_mb": 0
+    },
+    "accepting_tasks": true
+  },
+  "tls": {
+    "ca_file": "certs/server.crt",
+    "server_hostname": "<PUBLIC_HOST>"
+  },
+  "discovery": {
+    "announce_interval_seconds": 5
+  },
+  "poll_interval_seconds": 1,
+  "log_level": "INFO",
+  "log_file": "var/remote/worker/worker.log"
+}
