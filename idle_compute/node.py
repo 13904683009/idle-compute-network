@@ -500,6 +500,10 @@ class Node:
                     self._reply_error(write, ErrorCode.BAD_SENDER, "HELLO body node_id != sender", env)
                     return
                 if env.sender not in self.config.peers:
+                    logger.warning(
+                        "connection rejected peer=%s reason=not in allowlist",
+                        env.sender[:12],
+                    )
                     self._reply_error(write, ErrorCode.UNAUTHORIZED, "sender not in allowlist", env)
                     return
                 if self._ratelimit.blocked(env.sender):
@@ -508,6 +512,11 @@ class Node:
                     self._reply_error(write, ErrorCode.OVERLOAD, "peer is rate limited", env)
                     return
                 bound = env.sender
+                logger.info(
+                    "connection established peer=%s transport=%s",
+                    env.sender[:12],
+                    transport_peer[:16],
+                )
                 # Mutual HELLO handshake: the dialer's gate also demands a
                 # HELLO as ITS first inbound frame, so our own HELLO goes
                 # out BEFORE the HELLO_ACK. A peer replying to our HELLO
@@ -920,6 +929,7 @@ class Node:
     def _handle_task_create(self, env: Any, write: Callable[[bytes], None]) -> None:
         client_ref = env.body["client_ref"]
         row = self._aux_query("SELECT task_id FROM client_refs WHERE client_ref=?", (client_ref,))
+        created = row is None
         if row is not None:
             task_id = row[0]
         else:
@@ -931,6 +941,7 @@ class Node:
                 _TERMINAL_TASK_STATUSES,
             ).fetchone()[0]
             if int(live) >= MAX_ACTIVE_TASKS:
+                logger.info("task create rejected requester=%s reason=pool_full", env.sender[:12])
                 self._reply_error(write, ErrorCode.OVERLOAD, "task pool is full", env)
                 return
             try:
@@ -943,6 +954,12 @@ class Node:
                     lease_seconds=env.body["lease_seconds"],
                 )
             except InsufficientCredit as exc:
+                logger.info(
+                    "task create rejected requester=%s reason=insufficient_credit cost=%s available=%s",
+                    env.sender[:12],
+                    exc.cost,
+                    exc.available,
+                )
                 self._reply_error(
                     write,
                     ErrorCode.INSUFFICIENT_CREDIT,
@@ -958,6 +975,14 @@ class Node:
                 "INSERT OR IGNORE INTO client_refs(client_ref,task_id,created_at) VALUES (?,?,?)",
                 (client_ref, task_id, utc_now()),
             )
+        if created:
+            logger.info(
+                "task %s CREATED requester=%s status=QUEUED",
+                task_id,
+                env.sender[:12],
+            )
+        else:
+            logger.info("task %s CREATE replay (idempotent)", task_id)
         self._reply(write, MessageType.TASK_CREATE_ACK, {"client_ref": client_ref, "task_id": task_id}, env)
 
     def _handle_claim_request(self, env: Any, write: Callable[[bytes], None]) -> None:
@@ -1023,6 +1048,12 @@ class Node:
         )
         # D4: CLAIM_GRANT stays as a compatibility notification; EXECUTION of
         # this task requires the dual-signed lease negotiated below.
+        logger.info(
+            "task %s LEASED lease=%s worker=%s",
+            task.task_id,
+            lease.lease_id,
+            env.sender[:12],
+        )
         if self.config.lease.mode == "dual_signed":
             try:
                 self._propose_lease(lease, task, env, write)
@@ -1197,6 +1228,10 @@ class Node:
             return
         validation = self._store.validate_result(result.result_id, self.identity.node_id)
         if validation.status is ValidationStatus.VALID:
+            logger.info(
+                "task %s COMPLETED validation=VALID credit=1",
+                result.task_id,
+            )
             credit = self._credit_row_for(result.result_id)
             if credit is None:
                 # Ledger wrote the event but export cannot see it: do NOT
@@ -1218,6 +1253,11 @@ class Node:
                 env,
             )
             return
+        logger.info(
+            "task %s REJECTED validation=INVALID reason=%s",
+            result.task_id,
+            str(validation.reason)[:120],
+        )
         self._reply(
             write,
             MessageType.RESULT_ACK,
@@ -1340,10 +1380,11 @@ class Node:
                 addrs[0],
             )
             logger.info(
-                "node started role=%s node_id=%s addr=%s",
+                "node started role=%s node_id=%s listen=%s tls=%s",
                 self.config.role,
                 self.identity.node_id,
                 addrs[0],
+                "on" if self.config.tls is not None else "off",
             )
 
     def run(self) -> int:
@@ -1554,20 +1595,29 @@ class Node:
         if self._connected:
             return
         coordinator = self.config.coordinator_node_id
-        self.transport.dial(coordinator, [self.config.coordinator_addr])
-        addrs = self.transport.advertised_addrs() or [
-            f"{self.config.listen_host}:{self.config.listen_port}"
-        ]
-        seq = self._send_to(
-            coordinator,
-            MessageType.HELLO,
-            {"node_id": self.identity.node_id, "role": "worker", "listen_addrs": addrs[:1]},
-        )
-        self._await(
-            lambda e: e.type is MessageType.HELLO_ACK and e.sender == coordinator,
-            HELLO_ACK_TIMEOUT,
-            seq,
-        )
+        try:
+            self.transport.dial(coordinator, [self.config.coordinator_addr])
+            addrs = self.transport.advertised_addrs() or [
+                f"{self.config.listen_host}:{self.config.listen_port}"
+            ]
+            seq = self._send_to(
+                coordinator,
+                MessageType.HELLO,
+                {"node_id": self.identity.node_id, "role": "worker", "listen_addrs": addrs[:1]},
+            )
+            self._await(
+                lambda e: e.type is MessageType.HELLO_ACK and e.sender == coordinator,
+                HELLO_ACK_TIMEOUT,
+                seq,
+            )
+        except (TransportError, NodeError) as exc:
+            logger.warning(
+                "connection to coordinator %s at %s failed: %s",
+                str(coordinator)[:12],
+                self.config.coordinator_addr,
+                exc,
+            )
+            raise
         self._connected = True
         logger.info("connected to coordinator %s", coordinator[:12])
 
@@ -1801,21 +1851,35 @@ class Node:
         coordinator = self.config.coordinator_node_id
         if not coordinator or not self.config.coordinator_addr:
             raise NodeError("client requires coordinator_node_id and coordinator_addr")
-        self.transport.dial(coordinator, [self.config.coordinator_addr])
-        addrs = self.transport.advertised_addrs() or [
-            f"{self.config.listen_host}:{self.config.listen_port}"
-        ]
-        seq = self._send_to(
-            coordinator,
-            MessageType.HELLO,
-            {"node_id": self.identity.node_id, "role": "client", "listen_addrs": addrs[:1]},
-        )
-        self._await(
-            lambda e: e.type is MessageType.HELLO_ACK and e.sender == coordinator,
-            HELLO_ACK_TIMEOUT,
-            seq,
-        )
+        try:
+            self.transport.dial(coordinator, [self.config.coordinator_addr])
+            addrs = self.transport.advertised_addrs() or [
+                f"{self.config.listen_host}:{self.config.listen_port}"
+            ]
+            seq = self._send_to(
+                coordinator,
+                MessageType.HELLO,
+                {"node_id": self.identity.node_id, "role": "client", "listen_addrs": addrs[:1]},
+            )
+            self._await(
+                lambda e: e.type is MessageType.HELLO_ACK and e.sender == coordinator,
+                HELLO_ACK_TIMEOUT,
+                seq,
+            )
+        except (TransportError, NodeError) as exc:
+            logger.warning(
+                "connection to coordinator %s at %s failed: %s",
+                str(coordinator)[:12],
+                self.config.coordinator_addr,
+                exc,
+            )
+            raise
         self._connected = True
+        logger.info(
+            "connected to coordinator %s at %s",
+            coordinator[:12],
+            self.config.coordinator_addr,
+        )
 
     def client_create_task(
         self,

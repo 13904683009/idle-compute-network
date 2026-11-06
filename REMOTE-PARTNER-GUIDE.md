@@ -286,6 +286,15 @@ python -m idle_compute credit --db var/remote/coordinator/coordinator.db --peer 
 
 ---
 
+## 9a. 关键日志字段（用于远程排查）
+
+- 启动：`node started role=... listen=... tls=on|off node_id=...`
+- 连接：`connection established peer=<id 前缀> transport=...`；
+  失败：`connection to coordinator <id 前缀> at <host:port> failed: <原因>`
+- 任务：`task <id> CREATED ... status=QUEUED`、`task <id> LEASED ...`、
+  `task <id> COMPLETED validation=VALID`、`task <id> REJECTED validation=INVALID reason=...`
+- 日志只包含 node_id 前缀、任务/租约 id 与错误原因，不记录私钥、证书内容或任务数据。
+
 ## 10. 常见问题与排查
 
 | 症状 | 原因 / 处理 |
