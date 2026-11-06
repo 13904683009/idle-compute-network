@@ -1,6 +1,7 @@
 # D6 设计：真实双设备验收（仅设计，未执行）
 
-> **状态：D6 未执行。** 本文件只是验收设计与检查表，不包含任何双设备实测结果；
+> **状态：D6 仍为 NOT TESTED。** 本文件、`scripts/d6_preflight.py` 与所有演示脚本都只是准备材料，
+> 不包含任何双设备实测结果；
 > 在真正完成两机测试并附证据前，不得声称“真实双设备已验证”或“D6 通过”。
 > 当前已知限制：C5 只有“重启 fail-closed”最小语义测试，没有自动重连/恢复实现。
 
@@ -115,3 +116,92 @@
   不一致，只记录，不在 D6 内改注册表设计；
 - A6（本地 CLI 隔离）已由静态+语义测试覆盖；C5 只覆盖“重启 fail-closed”，
   **D6 不得把 C5 结果当作自动恢复能力**。
+
+## 10. 单机预检（D6 前必须通过）
+
+```bash
+# 在 A、B 两台设备上分别执行，并保留 JSON 作为证据
+python scripts/d6_preflight.py --json --out var/d6/preflight-<device>.json
+```
+
+- `--allow-dirty` 仅供开发自测；D6 当天不得使用（必须干净提交）。
+- `--full` 额外跑完整测试套件（较慢，建议 D6 前最后一次使用）。
+- 退出码：0 = 无 FAIL（WARN 可接受，但要在结果表中登记）；1 = 有 FAIL，**停止 D6**。
+- 脚本**不建立任何跨设备连接**，不代替 D6。
+
+预检共 16 项：
+
+| # | id | 检查 | D6 前要求 |
+| --- | --- | --- | --- |
+| 1 | `python_version` | Python ≥ 3.11 | PASS |
+| 2 | `cli_help` | `python -m idle_compute --help` | PASS |
+| 3 | `cli_node_help` | `python -m idle_compute node --help` | PASS |
+| 4 | `cli_credit_help` | `python -m idle_compute credit --help` | PASS |
+| 5 | `git_revision` | HEAD 与工作树 | PASS（clean；记录 commit） |
+| 6 | `source_doc_gates` | 源码/文档安全门禁 | PASS |
+| 7 | `critical_regressions` | C5 + CREDIT + CLI 回归 | PASS |
+| 8 | `db_schema` | tasks/leases/lease_negotiations/credit_holds/credit_events | PASS |
+| 9 | `config_examples` | coordinator/worker/client 配置可解析 | PASS |
+| 10 | `public_listen_guard` | 非 loopback 监听必须显式 opt-in | PASS |
+| 11 | `capability_signing` | manifest 签名/验签 | PASS |
+| 12 | `port_bind` | loopback 端口可绑定 | PASS |
+| 13 | `lan_interface` | 存在非 loopback IPv4（候选 LAN 地址） | PASS 或 WARN（记录） |
+| 14 | `firewall_reachability` | 防火墙/NAT/互达 | **WARN：只能在 D6 实测** |
+| 15 | `clock_snapshot` | 设备 UTC/时区偏移 | PASS（记录） |
+| 16 | `cross_device_clock_skew` | 两机时钟偏差 | **WARN：D6 当天实测** |
+
+## 11. D6 通过所需的最小证据集
+
+所有时间必须为 **UTC ISO-8601**；所有文件放在 `var/d6/evidence-<device>-<timestamp>/`
+（不提交仓库）。**E1–E12 缺一不可**，缺任何一项即判 NOT PASS。
+
+| ID | 证据 | 采集方式 | 通过条件 |
+| --- | --- | --- | --- |
+| E1 | 两机环境 | `git rev-parse HEAD`、`python --version`、OS 版本 | 同一 commit；Python ≥3.11；记录 OS |
+| E2 | 脱敏配置快照 | 两机 node JSON（保留 role/listen/peers 数量/credits.task_cost，隐藏密钥） | coordinator 有 `allow_public_listen` 决策；peers 互相包含；付费时 task_cost 明确 |
+| E3 | 预检报告 | `d6_preflight.py --json --out ...` 各一份 | 两机均 exit 0；记录 WARN 项 |
+| E4 | 网络可达 | B→A `Test-NetConnection <A_IP> <PORT>`；双方 HELLO 日志 | TCP 可达；HELLO/HELLO_ACK 均有 UTC 时间戳 |
+| E5 | 任务创建 | client `node create-task` 输出（task_id / client_ref） | 收到 TASK_CREATE_ACK；付费时 requester 有足够 available |
+| E6 | 租约状态机 | A 上 `SELECT lease_id, state, updated_at FROM lease_negotiations WHERE task_id=?` | 出现 `PROPOSED → ACCEPTED → ACTIVE → COMPLETED`，lease_id/terms_hash 与日志一致 |
+| E7 | commit 与执行 | worker/coordinator 日志（LEASE_PROPOSE/ACCEPT/COMMIT），worker 执行起止 UTC | 只有收到有效 LEASE_COMMIT 后才执行；日志时间顺序一致 |
+| E8 | 结果验证 | A 上 `SELECT status FROM results WHERE task_id=?`；validation 行 | `VALIDATED`/`VALID`，expected_hash 与重算一致 |
+| E9 | CREDIT 结算 | A 上 `SELECT COUNT(*) FROM credit_events WHERE task_id=?`；`credit --peer <requester>` 前后输出 | 该任务恰好 1 条 CREDIT；requester `held` 1→0、`spent` 0→1；worker earned +1 |
+| E10 | 时钟偏差 | 两机 D6 前后各记录一次 UTC 与本地偏移；可用 NTP/`w32tm` 参考 | 记录 A/B 偏差；建议 |skew| ≤ 2 s，且必须小于租约窗口的安全余量 |
+| E11 | 负向 fail-closed | 无 commit、取消/过期、错投/广播、worker 重启各一次 | 四类场景均未执行；有日志/DB 证据；不把 C5 当自动恢复 |
+| E12 | 清理与保密 | 证据目录清单；确认无 identity.key/ledger.key/私钥/DB 入库 | 只提交文档/脱敏日志；`PROJECT-STATUS-AND-HANDOFF.md` 不入库 |
+
+### 11.1 建议的最小 SQL
+
+```sql
+SELECT lease_id, state, updated_at FROM lease_negotiations WHERE task_id = :task;
+SELECT status, content_hash FROM results WHERE task_id = :task;
+SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM credit_events WHERE task_id = :task;
+```
+
+### 11.2 时钟偏差记录格式
+
+```json
+{"device": "A", "utc": "2026-11-06T03:00:00Z", "local_offset": "+08:00",
+ "reference_utc": "2026-11-06T03:00:01Z", "skew_ms": 1000, "measured_before": true, "measured_after": true}
+```
+
+## 12. D6 当天执行顺序（仅清单，本轮未执行）
+
+1. 两机 `git rev-parse HEAD` 相同、工作树 clean；
+2. 两机各跑 `d6_preflight.py`，保存 E1/E3，登记 WARN；
+3. 记录两机 D6 前时钟偏差（E10-before）；
+4. A 启动 coordinator（显式 LAN 绑定/防火墙只放行测试网段），B 启动 worker；
+5. B 跑免费路径 smoke（cost=0），保存 E4–E9；
+6. 重启 A 的 coordinator 为 `task_cost≥1`（或使用独立付费 DB），
+   requester 必须是已赚到 CREDIT 的 B 侧身份；保存付费路径 E5–E9；
+7. 依次执行 E11 负向用例；
+8. 记录 D6 后时钟偏差（E10-after）；
+9. 停止进程、保存 E12、填写 §7 结果表；
+10. 任何 FAIL/缺少证据 → 判 NOT PASS，停止并记录，不在 D6 当场改代码。
+
+## 13. 判停与诚实性
+
+- 本文件所有结果行仍为 **NOT TESTED**；`d6_preflight.py` 通过 ≠ D6 通过；
+- 预检 WARN 项（防火墙/跨机时钟）必须由 D6 实测填补；
+- 单机 loopback demo（`DEMO.md`）**不是** D6 证据；
+- 未执行 D6 前，任何“真实双设备已验证”的表述都禁止。
