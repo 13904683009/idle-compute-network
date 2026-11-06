@@ -295,6 +295,47 @@ python -m idle_compute credit --db var/remote/coordinator/coordinator.db --peer 
   `task <id> COMPLETED validation=VALID`、`task <id> REJECTED validation=INVALID reason=...`
 - 日志只包含 node_id 前缀、任务/租约 id 与错误原因，不记录私钥、证书内容或任务数据。
 
+## 9b. 查看 Worker 自己完成的任务
+
+```bash
+python -m idle_compute worker-tasks \
+  --db var/remote/coordinator/coordinator.db \
+  --peer <WORKER_NODE_ID>
+# 可选 --limit N（1..1000）
+```
+
+输出示例：
+
+```json
+{
+  "peer": "<WORKER_NODE_ID>",
+  "count": 2,
+  "total_credit": 1,
+  "tasks": [
+    {
+      "task_id": "tsk_...",
+      "task_status": "COMPLETED",
+      "result_id": "res_...",
+      "result_status": "VALIDATED",
+      "submitted_at": "2026-11-07T00:00:00+00:00",
+      "credit": 1
+    },
+    {
+      "task_id": "tsk_...",
+      "task_status": "REJECTED",
+      "result_id": "res_...",
+      "result_status": "REJECTED",
+      "submitted_at": "2026-11-07T00:01:00+00:00",
+      "credit": 0
+    }
+  ]
+}
+```
+
+- 数据仅来自现有 DB 的 `tasks` / `results` / `credit_events`，不修改账本；
+- `credit` 是该 Worker 在该任务上获得的 CREDIT（被拒/无效结果为 0）；
+- 未知 peer 返回空列表；只显示该 peer 提交过结果的任务。
+
 ## 10. 常见问题与排查
 
 | 症状 | 原因 / 处理 |

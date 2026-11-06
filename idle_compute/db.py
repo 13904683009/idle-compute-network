@@ -926,6 +926,33 @@ class Store:
     def balances(self) -> dict[str, int]:
         return ledger.rebuild_ledger(self.conn, self.signer)["balances"]
 
+    def worker_tasks(self, peer_id: str, limit: int = 50) -> dict[str, Any]:
+        """Tasks this peer submitted results for, with the CREDIT earned.
+
+        Sources only: tasks, results, credit_events. ``credit`` is the sum of
+        this peer's credit events for that task (0 for rejected results).
+        """
+        if not isinstance(peer_id, str) or not peer_id:
+            raise ValueError("peer_id must be a non-empty string")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an int in 1..1000")
+        rows = self.conn.execute(
+            "SELECT t.task_id, t.status AS task_status, r.result_id, "
+            "r.status AS result_status, r.created_at AS submitted_at, "
+            "COALESCE((SELECT SUM(e.amount) FROM credit_events e "
+            "WHERE e.peer_id=? AND e.task_id=t.task_id),0) AS credit "
+            "FROM results r JOIN tasks t ON t.task_id=r.task_id "
+            "WHERE r.peer_id=? ORDER BY r.created_at DESC, t.task_id LIMIT ?",
+            (peer_id, peer_id, limit),
+        ).fetchall()
+        tasks = [dict(row) for row in rows]
+        return {
+            "peer": peer_id,
+            "count": len(tasks),
+            "total_credit": sum(int(task["credit"]) for task in tasks),
+            "tasks": tasks,
+        }
+
     def credit_summary(self) -> dict[str, dict[str, int]]:
         """Per-peer earned/held/spent/refunded/available (no ledger rewrite).
 

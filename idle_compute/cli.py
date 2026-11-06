@@ -333,6 +333,17 @@ def cmd_balances(args: argparse.Namespace) -> int:
         coordinator.close()
 
 
+def cmd_worker_tasks(args: argparse.Namespace) -> int:
+    """List tasks a worker peer submitted, with the CREDIT earned per task."""
+    coordinator = _coordinator(args)
+    try:
+        payload = coordinator.store.worker_tasks(args.peer, limit=args.limit)
+    finally:
+        coordinator.close()
+    _print(payload)
+    return 0
+
+
 def cmd_credit(args: argparse.Namespace) -> int:
     """Show earned/held/spent/refunded/available CREDIT per peer."""
     coordinator = _coordinator(args)
@@ -410,6 +421,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     credit.add_argument("--peer", default=None, help="only show this peer (zeros if unknown)")
     credit.set_defaults(func=cmd_credit)
+
+    worker_tasks = sub.add_parser(
+        "worker-tasks",
+        parents=[common],
+        help="list tasks a worker peer submitted, with CREDIT earned",
+    )
+    worker_tasks.add_argument("--peer", required=True, help="worker node_id")
+    worker_tasks.add_argument("--limit", type=int, default=50, help="max tasks (1..1000)")
+    worker_tasks.set_defaults(func=cmd_worker_tasks)
 
     # ---- network commands (--config only, never --db/--key) ----
 
