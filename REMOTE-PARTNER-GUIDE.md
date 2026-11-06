@@ -336,6 +336,54 @@ python -m idle_compute worker-tasks \
 - `credit` 是该 Worker 在该任务上获得的 CREDIT（被拒/无效结果为 0）；
 - 未知 peer 返回空列表；只显示该 peer 提交过结果的任务。
 
+## 9c. 查看 Client 创建的任务与积分状态
+
+```bash
+python -m idle_compute client-tasks \
+  --db var/remote/coordinator/coordinator.db \
+  --peer <CLIENT_NODE_ID>
+# 可选 --limit N（1..1000）
+```
+
+输出示例：
+
+```json
+{
+  "peer": "<CLIENT_NODE_ID>",
+  "count": 3,
+  "total_spent": 1,
+  "tasks": [
+    {
+      "task_id": "tsk_...",
+      "task_status": "COMPLETED",
+      "cost": 1,
+      "credit_state": "SPENT",
+      "created_at": "2026-11-07T00:00:00+00:00"
+    },
+    {
+      "task_id": "tsk_...",
+      "task_status": "CANCELLED",
+      "cost": 1,
+      "credit_state": "REFUNDED",
+      "created_at": "2026-11-07T00:01:00+00:00"
+    },
+    {
+      "task_id": "tsk_...",
+      "task_status": "QUEUED",
+      "cost": 0,
+      "credit_state": "FREE",
+      "created_at": "2026-11-07T00:02:00+00:00"
+    }
+  ]
+}
+```
+
+- 数据来自现有 `tasks` / `task_requesters` / `credit_holds`，不修改账本；
+- 付费任务状态：`HELD`（冻结）/ `SPENT`（已完成消费）/ `REFUNDED`（失败/取消/过期退回）；
+- 免费任务显示 `FREE`（cost=0，无 hold）；`total_spent` 为已消费总额；
+- 只列出经节点 `TASK_CREATE`/`create_task_paid` 创建、有 requester 归属的任务；
+  旧版直接 `create_task()` 创建的任务没有 requester 记录，不会列出。
+
 ## 10. 常见问题与排查
 
 | 症状 | 原因 / 处理 |

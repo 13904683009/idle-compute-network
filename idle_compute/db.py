@@ -163,6 +163,17 @@ CREATE TABLE IF NOT EXISTS credit_holds (
 );
 CREATE INDEX IF NOT EXISTS credit_holds_requester ON credit_holds(requester_id);
 
+-- Requester attribution for client visibility (all paid AND free tasks created
+-- through create_task_paid / the node TASK_CREATE path). Legacy tasks created
+-- via create_task() have no requester and are intentionally not listed.
+CREATE TABLE IF NOT EXISTS task_requesters (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+    requester_id TEXT NOT NULL,
+    cost INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_requesters_requester ON task_requesters(requester_id);
+
 CREATE TABLE IF NOT EXISTS results (
     result_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
@@ -530,8 +541,12 @@ class Store:
             if cost > 0 and available < cost:
                 raise InsufficientCredit(requester_id, cost, available)
             task_id = self._insert_task_locked(task_type, payload, max_attempts, lease_seconds)
+            now = utc_now()
+            self.conn.execute(
+                "INSERT INTO task_requesters(task_id,requester_id,cost,created_at) VALUES (?,?,?,?)",
+                (task_id, requester_id, cost, now),
+            )
             if cost > 0:
-                now = utc_now()
                 self.conn.execute(
                     "INSERT INTO credit_holds(task_id,requester_id,amount,state,created_at,updated_at) "
                     "VALUES (?,?,?,?,?,?)",
@@ -950,6 +965,54 @@ class Store:
             "peer": peer_id,
             "count": len(tasks),
             "total_credit": sum(int(task["credit"]) for task in tasks),
+            "tasks": tasks,
+        }
+
+    def client_tasks(self, peer_id: str, limit: int = 50) -> dict[str, Any]:
+        """Tasks this peer created as requester, with their CREDIT state.
+
+        Sources: tasks, task_requesters, credit_holds. Paid tasks show
+        HELD/SPENT/REFUNDED; free tasks (cost 0) show FREE. Legacy tasks
+        created via create_task() have no requester attribution and are not
+        listed (they are outside the client-create path).
+        """
+        if not isinstance(peer_id, str) or not peer_id:
+            raise ValueError("peer_id must be a non-empty string")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an int in 1..1000")
+        rows = self.conn.execute(
+            "SELECT task_id, task_status, cost, created_at, hold_state FROM ("
+            "SELECT t.task_id AS task_id, t.status AS task_status, q.cost AS cost, "
+            "q.created_at AS created_at, h.state AS hold_state "
+            "FROM task_requesters q JOIN tasks t ON t.task_id=q.task_id "
+            "LEFT JOIN credit_holds h ON h.task_id=q.task_id "
+            "WHERE q.requester_id=? "
+            "UNION "
+            "SELECT t.task_id AS task_id, t.status AS task_status, h.amount AS cost, "
+            "h.created_at AS created_at, h.state AS hold_state "
+            "FROM credit_holds h JOIN tasks t ON t.task_id=h.task_id "
+            "LEFT JOIN task_requesters q ON q.task_id=h.task_id "
+            "WHERE h.requester_id=? AND q.task_id IS NULL"
+            ") ORDER BY created_at DESC, task_id LIMIT ?",
+            (peer_id, peer_id, limit),
+        ).fetchall()
+        tasks: list[dict[str, Any]] = []
+        for row in rows:
+            cost = int(row["cost"])
+            state = row["hold_state"] or ("FREE" if cost == 0 else "UNKNOWN")
+            tasks.append(
+                {
+                    "task_id": row["task_id"],
+                    "task_status": row["task_status"],
+                    "cost": cost,
+                    "credit_state": state,
+                    "created_at": row["created_at"],
+                }
+            )
+        return {
+            "peer": peer_id,
+            "count": len(tasks),
+            "total_spent": sum(task["cost"] for task in tasks if task["credit_state"] == "SPENT"),
             "tasks": tasks,
         }
 

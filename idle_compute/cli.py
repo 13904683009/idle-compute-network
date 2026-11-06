@@ -333,6 +333,17 @@ def cmd_balances(args: argparse.Namespace) -> int:
         coordinator.close()
 
 
+def cmd_client_tasks(args: argparse.Namespace) -> int:
+    """List tasks a client peer created, with the CREDIT hold state per task."""
+    coordinator = _coordinator(args)
+    try:
+        payload = coordinator.store.client_tasks(args.peer, limit=args.limit)
+    finally:
+        coordinator.close()
+    _print(payload)
+    return 0
+
+
 def cmd_worker_tasks(args: argparse.Namespace) -> int:
     """List tasks a worker peer submitted, with the CREDIT earned per task."""
     coordinator = _coordinator(args)
@@ -430,6 +441,15 @@ def build_parser() -> argparse.ArgumentParser:
     worker_tasks.add_argument("--peer", required=True, help="worker node_id")
     worker_tasks.add_argument("--limit", type=int, default=50, help="max tasks (1..1000)")
     worker_tasks.set_defaults(func=cmd_worker_tasks)
+
+    client_tasks = sub.add_parser(
+        "client-tasks",
+        parents=[common],
+        help="list tasks a client peer created, with CREDIT hold state",
+    )
+    client_tasks.add_argument("--peer", required=True, help="requester/client node_id")
+    client_tasks.add_argument("--limit", type=int, default=50, help="max tasks (1..1000)")
+    client_tasks.set_defaults(func=cmd_client_tasks)
 
     # ---- network commands (--config only, never --db/--key) ----
 
