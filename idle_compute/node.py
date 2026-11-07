@@ -41,6 +41,7 @@ protocol, and transports are the only shared machinery.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import queue
@@ -372,6 +373,61 @@ class Node:
             self._aux.execute(sql, params)
             self._aux.commit()
 
+    def _try_accept_invite(self, peer_id: str, invite: Any, role: str) -> bool:
+        """Consume a one-time invite and enroll the sender (coordinator only)."""
+        if self.config.role != "coordinator" or self._aux is None:
+            return False
+        if not isinstance(invite, str) or not invite or len(invite) > 4096:
+            return False
+        digest = hashlib.sha256(invite.encode("utf-8")).hexdigest()
+        now = datetime.now(timezone.utc)
+        with self._aux_lock:
+            try:
+                self._aux.execute("BEGIN IMMEDIATE")
+                row = self._aux.execute(
+                    "SELECT role,expires_at,used_at FROM invites WHERE invite_hash=?",
+                    (digest,),
+                ).fetchone()
+                if row is None or row[2] is not None:
+                    self._aux.rollback()
+                    return False
+                if datetime.fromisoformat(str(row[1])) <= now:
+                    self._aux.rollback()
+                    return False
+                if str(row[0]) not in ("any", role):
+                    self._aux.rollback()
+                    return False
+                moment = now.isoformat()
+                self._aux.execute(
+                    "UPDATE invites SET used_at=?, used_by=? WHERE invite_hash=? AND used_at IS NULL",
+                    (moment, peer_id, digest),
+                )
+                self._aux.execute(
+                    "INSERT INTO joined_peers(peer_id,role,added_at,invite_hash) VALUES (?,?,?,?) "
+                    "ON CONFLICT(peer_id) DO UPDATE SET role=excluded.role, "
+                    "invite_hash=excluded.invite_hash",
+                    (peer_id, role, moment, digest),
+                )
+                self._aux.commit()
+            except (sqlite3.Error, ValueError):
+                try:
+                    self._aux.rollback()
+                except sqlite3.Error:
+                    pass
+                logger.warning("invite consumption failed for %s", peer_id[:12])
+                return False
+        logger.info("invite accepted peer=%s role=%s", peer_id[:12], role)
+        return True
+
+    def _has_joined(self, peer_id: str) -> bool:
+        if self._aux is None:
+            return False
+        try:
+            row = self._aux_query("SELECT 1 FROM joined_peers WHERE peer_id=?", (peer_id,))
+        except sqlite3.Error:
+            return False
+        return row is not None
+
     # ------------------------------------------------------------- sending
 
     def _build(self, type_: MessageType, body: dict[str, Any], recipient: str | None = None, in_reply_to: int | None = None) -> bytes:
@@ -500,12 +556,20 @@ class Node:
                     self._reply_error(write, ErrorCode.BAD_SENDER, "HELLO body node_id != sender", env)
                     return
                 if env.sender not in self.config.peers:
-                    logger.warning(
-                        "connection rejected peer=%s reason=not in allowlist",
-                        env.sender[:12],
-                    )
-                    self._reply_error(write, ErrorCode.UNAUTHORIZED, "sender not in allowlist", env)
-                    return
+                    invite = env.body.get("invite")
+                    if invite and self._try_accept_invite(
+                        env.sender, invite, str(env.body.get("role", ""))
+                    ):
+                        self._allowlisted.add(env.sender)
+                    elif self._has_joined(env.sender):
+                        self._allowlisted.add(env.sender)
+                    else:
+                        logger.warning(
+                            "connection rejected peer=%s reason=not in allowlist",
+                            env.sender[:12],
+                        )
+                        self._reply_error(write, ErrorCode.UNAUTHORIZED, "sender not in allowlist", env)
+                        return
                 if self._ratelimit.blocked(env.sender):
                     # The node id is quarantined: refuse the handshake so a TCP
                     # reconnect cannot reset the bucket.
@@ -1842,6 +1906,32 @@ class Node:
         )
 
     # --------------------------------------------------------- client ops
+
+    def join_with_invite(self, invite: str, timeout: float = 30.0) -> dict[str, Any]:
+        """Dial the coordinator and enroll using a one-time invite code."""
+        if not isinstance(invite, str) or not invite:
+            raise NodeError("invite must be a non-empty string")
+        self._configure_logging()
+        self._ensure_transport_started()
+        coordinator = self.config.coordinator_node_id
+        addr = self.config.coordinator_addr
+        if not coordinator or not addr:
+            raise NodeError("join requires coordinator_node_id and coordinator_addr")
+        self.transport.dial(coordinator, [addr])
+        addrs = self.transport.advertised_addrs() or [
+            f"{self.config.listen_host}:{self.config.listen_port}"
+        ]
+        body = self._hello_body()
+        body["invite"] = invite
+        seq = self._send_to(coordinator, MessageType.HELLO, body)
+        ack = self._await(
+            lambda e: e.type is MessageType.HELLO_ACK and e.sender == coordinator,
+            timeout,
+            seq,
+        )
+        self._connected = True
+        logger.info("joined coordinator %s via invite", coordinator[:12])
+        return dict(ack.body)
 
     def _client_ensure_connected(self, timeout: float) -> None:
         self._configure_logging()

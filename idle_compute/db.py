@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -54,6 +54,22 @@ class NegotiationConflict(StoreError):
 
 class InvalidNegotiationState(StoreError):
     """The negotiation is not in a state that allows this transition."""
+
+
+class InviteError(StoreError):
+    """Invite invalid/expired/used/role-mismatched."""
+
+    INVALID = "INVITE_INVALID"
+    EXPIRED = "INVITE_EXPIRED"
+    USED = "INVITE_USED"
+    ROLE = "INVITE_ROLE_MISMATCH"
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+INVITE_ROLES = ("worker", "client", "any")
 
 
 class InsufficientCredit(StoreError):
@@ -173,6 +189,24 @@ CREATE TABLE IF NOT EXISTS task_requesters (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS task_requesters_requester ON task_requesters(requester_id);
+
+-- One-time invite enrollment: the code itself never lands in the DB (only its
+-- SHA-256), expires_at is UTC ISO-8601, and joined_peers makes enrollment
+-- survive coordinator restarts without rewriting the config file.
+CREATE TABLE IF NOT EXISTS invites (
+    invite_hash TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    used_by TEXT
+);
+CREATE TABLE IF NOT EXISTS joined_peers (
+    peer_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    invite_hash TEXT
+);
 
 CREATE TABLE IF NOT EXISTS results (
     result_id TEXT PRIMARY KEY,
@@ -1015,6 +1049,62 @@ class Store:
             "total_spent": sum(task["cost"] for task in tasks if task["credit_state"] == "SPENT"),
             "tasks": tasks,
         }
+
+    def create_invite(
+        self, invite_hash: str, role: str, expires_at: str, now: str | None = None
+    ) -> None:
+        if not isinstance(invite_hash, str) or len(invite_hash) < 16:
+            raise ValueError("invite_hash must be a non-empty digest")
+        if role not in INVITE_ROLES:
+            raise ValueError(f"role must be one of {', '.join(INVITE_ROLES)}")
+        created = now or utc_now()
+        with self.transaction():
+            self.conn.execute(
+                "INSERT INTO invites(invite_hash,role,created_at,expires_at) VALUES (?,?,?,?)",
+                (invite_hash, role, created, expires_at),
+            )
+
+    def consume_invite(
+        self, invite_hash: str, peer_id: str, role: str, now: str | None = None
+    ) -> dict[str, Any]:
+        """Consume an invite once and enroll ``peer_id``; atomically."""
+        moment = now or utc_now()
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT * FROM invites WHERE invite_hash=?", (invite_hash,)
+            ).fetchone()
+            if row is None:
+                raise InviteError(InviteError.INVALID, "invite not found")
+            if row["used_at"] is not None:
+                raise InviteError(InviteError.USED, "invite already used")
+            try:
+                expired = datetime.fromisoformat(row["expires_at"]) <= datetime.fromisoformat(moment)
+            except ValueError:
+                raise InviteError(InviteError.INVALID, "invite expiry malformed") from None
+            if expired:
+                raise InviteError(InviteError.EXPIRED, "invite expired")
+            if row["role"] not in ("any", role):
+                raise InviteError(
+                    InviteError.ROLE,
+                    f"invite is for role {row['role']!r}, not {role!r}",
+                )
+            self.conn.execute(
+                "UPDATE invites SET used_at=?, used_by=? WHERE invite_hash=? AND used_at IS NULL",
+                (moment, peer_id, invite_hash),
+            )
+            self.conn.execute(
+                "INSERT INTO joined_peers(peer_id,role,added_at,invite_hash) VALUES (?,?,?,?) "
+                "ON CONFLICT(peer_id) DO UPDATE SET role=excluded.role, "
+                "invite_hash=excluded.invite_hash",
+                (peer_id, role, moment, invite_hash),
+            )
+            return {"peer_id": peer_id, "role": role, "used_at": moment}
+
+    def has_joined(self, peer_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM joined_peers WHERE peer_id=?", (peer_id,)
+        ).fetchone()
+        return row is not None
 
     def credit_summary(self) -> dict[str, dict[str, int]]:
         """Per-peer earned/held/spent/refunded/available (no ledger rewrite).

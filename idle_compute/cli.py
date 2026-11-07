@@ -10,20 +10,34 @@ print key material.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
+import secrets
 import sqlite3
+import ssl
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .coordinator import Coordinator
-from .config import load_config
-from .db import DuplicateSubmission, DuplicateValidation, LeaseExpired, StoreError, TaskUnavailable
+from .config import from_dict, load_config
+from .db import (
+    DuplicateSubmission,
+    DuplicateValidation,
+    InviteError,
+    LeaseExpired,
+    Store,
+    StoreError,
+    TaskUnavailable,
+)
 from .identity import NodeIdentity, is_valid_node_id
 from .ledger import LedgerError, ensure_ledger_copy, mirror_status
 from .node import Node, NodeError
 from .state_machine import InvalidTransition
 from .tasks import InvalidTaskInput
+from .transport_tcp import fetch_server_certificate
 
 
 def _print(value: Any) -> None:
@@ -373,6 +387,187 @@ def cmd_credit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _invite_code(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _invite_payload(code: str) -> dict[str, Any]:
+    padded = code + "=" * (-len(code) % 4)
+    try:
+        value = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception as exc:
+        raise ValueError(f"malformed invite code: {exc}") from None
+    if not isinstance(value, dict) or value.get("v") != 1:
+        raise ValueError("malformed invite code: unsupported version")
+    for key in ("secret", "coordinator_node_id", "addr", "role"):
+        if not isinstance(value.get(key), str) or not value[key]:
+            raise ValueError(f"invite code missing {key}")
+    return value
+
+
+def _cert_fingerprint(path: str) -> str:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+
+    cert = x509.load_pem_x509_certificate(Path(path).read_bytes())
+    return cert.fingerprint(hashes.SHA256()).hex()
+
+
+def _public_addr(cfg: Any) -> str:
+    """Best-effort public address for an invite (cert SAN preferred)."""
+    port = int(cfg.listen_port)
+    if cfg.tls is not None and cfg.tls.cert_file:
+        from cryptography import x509
+
+        cert = x509.load_pem_x509_certificate(Path(cfg.tls.cert_file).read_bytes())
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        ips = san.get_values_for_type(x509.IPAddress)
+        names = san.get_values_for_type(x509.DNSName)
+        host = str(ips[0]) if ips else (names[0] if names else "")
+        if host:
+            return f"{host}:{port}"
+    if cfg.listen_host in ("0.0.0.0", "::", ""):
+        raise ValueError("cannot infer public address; pass --addr <host:port>")
+    return f"{cfg.listen_host}:{port}"
+
+
+def _fetch_peer_cert(addr: str, timeout: float = 10.0) -> bytes:
+    return fetch_server_certificate(addr, timeout=timeout)
+
+
+def cmd_invite_create(args: argparse.Namespace) -> int:
+    if not 60 <= args.ttl <= 86400:
+        raise ValueError("--ttl must be in 60..86400 seconds")
+    cfg = load_config(args.config)
+    data_dir = Path(cfg.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    identity = NodeIdentity.load_or_create(data_dir / "identity.key", node_name=data_dir.name)
+    addr = args.addr or _public_addr(cfg)
+    cert_sha = (
+        _cert_fingerprint(cfg.tls.cert_file)
+        if cfg.tls is not None and cfg.tls.cert_file
+        else ""
+    )
+    secret = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(seconds=args.ttl)).isoformat()
+    db_path = Path(cfg.db_path) if cfg.db_path else data_dir / "coordinator.db"
+    store = Store(db_path, data_dir / "ledger.key")
+    try:
+        store.create_invite(
+            hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+            args.role,
+            expires_at,
+        )
+    finally:
+        store.close()
+    payload = {
+        "v": 1,
+        "secret": secret,
+        "coordinator_node_id": identity.node_id,
+        "addr": addr,
+        "role": args.role,
+        "cert_sha256": cert_sha,
+        "expires_at": expires_at,
+    }
+    _print(
+        {
+            "invite": _invite_code(payload),
+            "role": args.role,
+            "addr": addr,
+            "coordinator_node_id": identity.node_id,
+            "expires_at": expires_at,
+            "cert_sha256": cert_sha,
+        }
+    )
+    return 0
+
+
+_DEFAULT_CAPABILITY = {
+    "capability_version": 1,
+    "ttl_seconds": 3600,
+    "supported_task_types": ["numeric_batch_v1"],
+    "supported_runtimes": ["python_sandbox_v1"],
+    "hardware": {"cpu_arch": "x86_64", "cpu_cores": 4, "ram_mb": 8192},
+    "resource_limits": {
+        "max_cpu_cores": 2,
+        "max_ram_mb": 4096,
+        "max_gpu_memory_mb": 0,
+        "max_task_duration_seconds": 600,
+    },
+    "network": {"supported_transports": ["tcp"], "supports_relay": False},
+    "verification": {"level": "SELF_DECLARED", "benchmark_profile": None},
+    "available_resources": {"cpu_cores": 2, "ram_mb": 4096, "gpu_memory_mb": 0},
+    "accepting_tasks": True,
+}
+
+
+def cmd_join(args: argparse.Namespace) -> int:
+    code = _invite_payload(args.invite)
+    role = code["role"]
+    if role == "any":
+        if not args.role:
+            raise ValueError("invite is role-agnostic; pass --role worker|client")
+        role = args.role
+    elif args.role and args.role != role:
+        raise ValueError(f"invite is for role {role!r}, not {args.role!r}")
+    data_dir = Path(args.data_dir or f"var/remote/{role}")
+    config_out = Path(args.config_out) if args.config_out else data_dir / "node.json"
+    config: dict[str, Any] = {
+        "role": role,
+        "transport": "tcp",
+        "listen_host": "127.0.0.1",
+        "listen_port": 0,
+        "data_dir": str(data_dir),
+        "peers": [code["coordinator_node_id"]],
+        "coordinator_node_id": code["coordinator_node_id"],
+        "coordinator_addr": code["addr"],
+        "poll_interval_seconds": 1,
+        "log_level": "INFO",
+        "log_file": str(data_dir / f"{role}.log"),
+    }
+    expected = code.get("cert_sha256") or ""
+    if expected:
+        der = _fetch_peer_cert(code["addr"])
+        actual = hashlib.sha256(der).hexdigest()
+        if actual != expected:
+            raise ValueError(
+                "coordinator certificate fingerprint does not match the invite "
+                f"(expected {expected[:16]}..., got {actual[:16]}...)"
+            )
+        ca_path = Path(args.ca_file or "certs/server.crt")
+        ca_path.parent.mkdir(parents=True, exist_ok=True)
+        ca_path.write_text(ssl.DER_cert_to_PEM_cert(der), encoding="ascii")
+        config["tls"] = {
+            "ca_file": str(ca_path),
+            "server_hostname": code["addr"].rsplit(":", 1)[0].strip("[]"),
+        }
+    if role == "worker":
+        config["capability"] = _DEFAULT_CAPABILITY
+        config["discovery"] = {"announce_interval_seconds": 5}
+        config["poll_interval_seconds"] = 1
+    config_out.parent.mkdir(parents=True, exist_ok=True)
+    config_out.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    node = Node(from_dict(config))
+    try:
+        node.join_with_invite(code["secret"], timeout=args.timeout)
+        local_node_id = node.identity.node_id
+    finally:
+        node.shutdown()
+    _print(
+        {
+            "joined": True,
+            "node_id": local_node_id,
+            "coordinator_node_id": code["coordinator_node_id"],
+            "coordinator_addr": code["addr"],
+            "config": str(config_out),
+            "cert_sha256": expected or None,
+        }
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default="var/idle.db", help="SQLite database path")
@@ -441,6 +636,24 @@ def build_parser() -> argparse.ArgumentParser:
     worker_tasks.add_argument("--peer", required=True, help="worker node_id")
     worker_tasks.add_argument("--limit", type=int, default=50, help="max tasks (1..1000)")
     worker_tasks.set_defaults(func=cmd_worker_tasks)
+
+    invite = sub.add_parser("invite", help="create one-time enrollment invites")
+    invite_sub = invite.add_subparsers(dest="invite_command", required=True)
+    invite_create = invite_sub.add_parser("create", help="create a one-time invite code")
+    invite_create.add_argument("--config", required=True, help="coordinator config path")
+    invite_create.add_argument("--role", choices=["worker", "client", "any"], default="worker")
+    invite_create.add_argument("--ttl", type=int, default=3600, help="validity seconds (60..86400)")
+    invite_create.add_argument("--addr", default=None, help="public host:port (default: cert SAN/listen)")
+    invite_create.set_defaults(func=cmd_invite_create)
+
+    join = sub.add_parser("join", help="join a coordinator with a one-time invite code")
+    join.add_argument("--invite", required=True, help="invite code from 'invite create'")
+    join.add_argument("--role", choices=["worker", "client"], default=None)
+    join.add_argument("--data-dir", default=None)
+    join.add_argument("--config-out", default=None)
+    join.add_argument("--ca-file", default=None, help="where to save the pinned coordinator cert")
+    join.add_argument("--timeout", type=float, default=30.0)
+    join.set_defaults(func=cmd_join)
 
     client_tasks = sub.add_parser(
         "client-tasks",

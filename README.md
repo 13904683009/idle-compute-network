@@ -176,7 +176,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365   -keyout certs/server.key -
 
 ## 两台设备 / 团队模拟
 
-远程合作伙伴从零接入（证书、三端配置、免费/付费、排查）见 **[REMOTE-PARTNER-GUIDE.md](REMOTE-PARTNER-GUIDE.md)**。
+邀请码接入：Coordinator 运行 `python -m idle_compute invite create ...`，合作伙伴运行 `python -m idle_compute join --invite <code>`（详见指南）。\n\n远程合作伙伴从零接入（证书、三端配置、免费/付费、排查）见 **[REMOTE-PARTNER-GUIDE.md](REMOTE-PARTNER-GUIDE.md)**。
 
 见 **[TEAM-SIMULATION-GUIDE.md](TEAM-SIMULATION-GUIDE.md)**：公网/局域网地址、防火墙、启动顺序、
 证据采集表、PASS/FAIL 判据、清理与常见故障。**当前尚未在两台真实设备上执行**，

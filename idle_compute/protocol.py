@@ -513,6 +513,8 @@ def _check_hello(value: Any) -> None:
         and _is_listen_addrs(value.get("listen_addrs"))
     ):
         raise ProtocolError(ErrorCode.INVALID_BODY, "HELLO body must be {node_id, role, listen_addrs}")
+    if "invite" in value and not _is_short_str(value.get("invite"), 4096):
+        raise ProtocolError(ErrorCode.INVALID_BODY, "HELLO invite must be a string <= 4096")
 
 
 def _check_hello_ack(value: Any) -> None:
@@ -878,7 +880,17 @@ def validate_body(type_: MessageType, body: Any) -> dict[str, Any]:
         raise ProtocolError(ErrorCode.UNSUPPORTED_TYPE, f"no schema for message type {type_!r}")
     if not isinstance(body, dict):
         raise ProtocolError(ErrorCode.INVALID_BODY, "body must be a JSON object")
-    _keys_exact(body, *_BODY_KEYS[type_])
+    if type_ is MessageType.HELLO:
+        # HELLO may carry an optional one-time invite; no other extras.
+        required = set(_BODY_KEYS[type_])
+        allowed = required | {"invite"}
+        if not required.issubset(body) or not set(body).issubset(allowed):
+            raise ProtocolError(
+                ErrorCode.INVALID_BODY,
+                "HELLO body keys must be node_id, role, listen_addrs (+ optional invite)",
+            )
+    else:
+        _keys_exact(body, *_BODY_KEYS[type_])
     checker(body)
     return body
 

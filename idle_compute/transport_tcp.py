@@ -65,6 +65,7 @@ from .net_transport import (
 __all__ = [
     "TcpTransport",
     "TransportError",
+    "fetch_server_certificate",
     "write_rendezvous_file",
     "read_rendezvous_file",
 ]
@@ -106,6 +107,23 @@ def _parse_addr(addr: str) -> tuple[str, int]:
     if not 0 < port < 65536:
         raise ValueError(f"port out of range in address {addr!r}")
     return host, port
+
+
+def fetch_server_certificate(addr: str, timeout: float = 10.0) -> bytes:
+    """Fetch the server certificate DER without verification.
+
+    Only for the invite bootstrap: the caller MUST compare the returned DER
+    against the SHA-256 fingerprint carried in the out-of-band invite before
+    trusting it. This is the only networking helper outside TcpTransport.
+    """
+    host, port = _parse_addr(addr)
+    context = ssl._create_unverified_context()
+    with socket.create_connection((host, port), timeout=timeout) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as tls:
+            der = tls.getpeercert(binary_form=True)
+    if not der:
+        raise ValueError("server did not present a certificate")
+    return der
 
 
 class _Conn:

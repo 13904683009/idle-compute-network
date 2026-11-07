@@ -193,6 +193,82 @@ Coordinator 用 `cert_file` + `key_file`；Worker/Client 用 `ca_file` + `server
 
 ---
 
+## 5a. 使用一次性邀请码加入（推荐）
+
+不再需要手动交换 node_id、`peers add` 或重启 Coordinator。
+
+### Coordinator 生成邀请
+
+```bash
+cd /home/admin/idle-compute-network   # 或你的 Coordinator 目录
+.venv/bin/python -m idle_compute invite create \
+  --config var/public-coord/node.json \
+  --role worker --ttl 3600
+```
+
+输出（示例，`invite` 是完整的一次性码）：
+
+```json
+{
+  "invite": "eyJhZGRyIjoiMTAxLjEzMy4yMzMuMTI2OjE3NzAwIiwi...",
+  "role": "worker",
+  "addr": "101.133.233.126:17700",
+  "coordinator_node_id": "12D3KooW...",
+  "expires_at": "2026-11-07T15:00:00+00:00",
+  "cert_sha256": "d3be..."
+}
+```
+
+- 默认 `--ttl 3600` 秒（60..86400）；一次性使用，过期/用后失效。
+- Worker 和 Client 身份分别生成邀请（`--role worker` / `--role client`，
+  或用 `--role any` 再在 join 时指定）。
+- 邀请码是 bearer secret，只通过可信渠道发给对方，不要公开。
+
+### 合作伙伴加入
+
+```bash
+git clone -b phase2 https://github.com/13904683009/idle-compute-network.git
+cd idle-compute-network
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+python -m idle_compute join \
+  --invite '<完整邀请码>' \
+  --role worker \
+  --data-dir var/remote/worker
+```
+
+`join` 会自动完成：
+
+1. 从邀请码读取 Coordinator 地址/node_id/TLS 证书指纹；
+2. 通过 TLS 获取并 **按指纹固定** 服务端证书，保存到 `certs/server.crt`；
+3. 生成可直接使用的 `var/remote/worker/node.json`（含 peers、TLS、capability）；
+4. 向 Coordinator 发送带邀请码的 HELLO；Coordinator 原子消费邀请码，
+   把该 node_id 写入 `joined_peers`，**无需手动 peers add / 重启**；
+5. 返回 `joined: true` 与本地 node_id。
+
+随后启动 Worker：
+
+```bash
+python -m idle_compute node run --config var/remote/worker/node.json
+```
+
+Client 同样用独立邀请码：
+
+```bash
+python -m idle_compute join --invite '<邀请码>' --role client --data-dir var/remote/client
+python -m idle_compute node create-task --config var/remote/client/node.json --numbers 1,2,3
+```
+
+### 邀请码失效/校验失败
+
+- 过期、已使用、角色不匹配、证书指纹不匹配都会被拒绝；
+- 邀请码泄露后立即生成新码；旧码即使未被使用也会在过期后失效；
+- 公网部署必须 TLS；邀请码本身也只在 TLS 连接中发送。
+
+> 仍为单机/单 Coordinator 的邀请机制；**真实跨公网双设备验证尚未完成**，
+> 不要把本流程当作 D6 结果。
+
 ## 6. 启动（A 先，B 后）
 
 Coordinator（A）：
