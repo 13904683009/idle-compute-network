@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 
-from idle_compute.cli import main
+from idle_compute.cli import _invite_code, _invite_payload, main
 from idle_compute.db import InviteError, Store
 from idle_compute.protocol import MessageType, ProtocolError, validate_body
 
@@ -167,7 +167,118 @@ class InviteJoinCliTests(unittest.TestCase):
                     ]
                 )
             self.assertNotEqual(reuse_code, 0)
-            self.assertIn("allowlist", reuse_err.getvalue())
+            self.assertIn("已被使用", reuse_err.getvalue())
+
+            # A client invite works through the same path.
+            client_out = StringIO()
+            with redirect_stdout(client_out):
+                self.assertEqual(
+                    main(["invite", "create", "--config", str(config_path), "--role", "client"]),
+                    0,
+                )
+            client_invite = json.loads(client_out.getvalue())["invite"]
+            client_join_out = StringIO()
+            client_err = StringIO()
+            with redirect_stdout(client_join_out), redirect_stderr(client_err):
+                client_code = main(
+                    [
+                        "join",
+                        "--invite",
+                        client_invite,
+                        "--role",
+                        "client",
+                        "--data-dir",
+                        str(root / "client"),
+                        "--config-out",
+                        str(root / "client.json"),
+                        "--timeout",
+                        "20",
+                    ]
+                )
+            self.assertEqual(client_code, 0, client_err.getvalue())
+            client_joined = json.loads(client_join_out.getvalue())
+            self.assertTrue(client_joined["next"])
+            self.assertTrue((root / "client.json").is_file())
+            store = Store(root / "coord" / "coordinator.db", root / "coord" / "ledger.key")
+            try:
+                rows = {r["peer_id"]: r["role"] for r in store.conn.execute("SELECT peer_id,role FROM joined_peers")}
+                self.assertEqual(rows[client_joined["node_id"]], "client")
+            finally:
+                store.close()
+
+            # Expired invite produces an actionable error.
+            base = _invite_payload(invite)
+            expired_secret = "expired-test-secret"
+            store = Store(root / "coord" / "coordinator.db", root / "coord" / "ledger.key")
+            try:
+                import hashlib as _hashlib
+
+                store.create_invite(
+                    _hashlib.sha256(expired_secret.encode()).hexdigest(), "worker", _past()
+                )
+            finally:
+                store.close()
+            expired_code = _invite_code(
+                {
+                    "v": 1,
+                    "secret": expired_secret,
+                    "coordinator_node_id": base["coordinator_node_id"],
+                    "addr": base["addr"],
+                    "role": "worker",
+                    "cert_sha256": "",
+                    "expires_at": _past(),
+                }
+            )
+            expired_out = StringIO()
+            expired_err = StringIO()
+            with redirect_stdout(expired_out), redirect_stderr(expired_err):
+                expired_rc = main(
+                    [
+                        "join",
+                        "--invite",
+                        expired_code,
+                        "--role",
+                        "worker",
+                        "--data-dir",
+                        str(root / "worker3"),
+                        "--timeout",
+                        "10",
+                    ]
+                )
+            self.assertNotEqual(expired_rc, 0)
+            self.assertIn("已过期", expired_err.getvalue())
+
+    def test_join_connection_failure_is_actionable(self) -> None:
+        code = _invite_code(
+            {
+                "v": 1,
+                "secret": "connection-test-secret",
+                "coordinator_node_id": NODE_ID,
+                "addr": "127.0.0.1:1",
+                "role": "worker",
+                "cert_sha256": "",
+                "expires_at": _future(),
+            }
+        )
+        with tempfile.TemporaryDirectory(prefix="invite-conn-", ignore_cleanup_errors=True) as tmp:
+            out = StringIO()
+            err = StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = main(
+                    [
+                        "join",
+                        "--invite",
+                        code,
+                        "--role",
+                        "worker",
+                        "--data-dir",
+                        str(Path(tmp) / "worker"),
+                        "--timeout",
+                        "3",
+                    ]
+                )
+        self.assertNotEqual(rc, 0)
+        self.assertIn("无法连接 Coordinator", err.getvalue())
 
 
 if __name__ == "__main__":

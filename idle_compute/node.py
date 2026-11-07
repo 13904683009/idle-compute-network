@@ -373,12 +373,16 @@ class Node:
             self._aux.execute(sql, params)
             self._aux.commit()
 
-    def _try_accept_invite(self, peer_id: str, invite: Any, role: str) -> bool:
-        """Consume a one-time invite and enroll the sender (coordinator only)."""
+    def _try_accept_invite(self, peer_id: str, invite: Any, role: str) -> tuple[bool, str]:
+        """Consume a one-time invite and enroll the sender (coordinator only).
+
+        Returns ``(accepted, reason)``; reason is a short machine string used
+        in the UNAUTHORIZED reply so a joining peer gets an actionable error.
+        """
         if self.config.role != "coordinator" or self._aux is None:
-            return False
+            return False, "invalid"
         if not isinstance(invite, str) or not invite or len(invite) > 4096:
-            return False
+            return False, "invalid"
         digest = hashlib.sha256(invite.encode("utf-8")).hexdigest()
         now = datetime.now(timezone.utc)
         with self._aux_lock:
@@ -388,15 +392,18 @@ class Node:
                     "SELECT role,expires_at,used_at FROM invites WHERE invite_hash=?",
                     (digest,),
                 ).fetchone()
-                if row is None or row[2] is not None:
+                if row is None:
                     self._aux.rollback()
-                    return False
+                    return False, "invalid"
+                if row[2] is not None:
+                    self._aux.rollback()
+                    return False, "used"
                 if datetime.fromisoformat(str(row[1])) <= now:
                     self._aux.rollback()
-                    return False
+                    return False, "expired"
                 if str(row[0]) not in ("any", role):
                     self._aux.rollback()
-                    return False
+                    return False, "role_mismatch"
                 moment = now.isoformat()
                 self._aux.execute(
                     "UPDATE invites SET used_at=?, used_by=? WHERE invite_hash=? AND used_at IS NULL",
@@ -415,9 +422,9 @@ class Node:
                 except sqlite3.Error:
                     pass
                 logger.warning("invite consumption failed for %s", peer_id[:12])
-                return False
+                return False, "invalid"
         logger.info("invite accepted peer=%s role=%s", peer_id[:12], role)
-        return True
+        return True, ""
 
     def _has_joined(self, peer_id: str) -> bool:
         if self._aux is None:
@@ -557,18 +564,26 @@ class Node:
                     return
                 if env.sender not in self.config.peers:
                     invite = env.body.get("invite")
-                    if invite and self._try_accept_invite(
-                        env.sender, invite, str(env.body.get("role", ""))
-                    ):
+                    if invite:
+                        accepted, reason = self._try_accept_invite(
+                            env.sender, invite, str(env.body.get("role", ""))
+                        )
+                    else:
+                        accepted, reason = False, "missing"
+                    if accepted:
                         self._allowlisted.add(env.sender)
                     elif self._has_joined(env.sender):
                         self._allowlisted.add(env.sender)
                     else:
                         logger.warning(
-                            "connection rejected peer=%s reason=not in allowlist",
+                            "connection rejected peer=%s reason=%s",
                             env.sender[:12],
+                            reason,
                         )
-                        self._reply_error(write, ErrorCode.UNAUTHORIZED, "sender not in allowlist", env)
+                        message = (
+                            f"invite rejected: {reason}" if invite else "sender not in allowlist"
+                        )
+                        self._reply_error(write, ErrorCode.UNAUTHORIZED, message, env)
                         return
                 if self._ratelimit.blocked(env.sender):
                     # The node id is quarantined: refuse the handshake so a TCP

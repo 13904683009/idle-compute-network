@@ -34,10 +34,15 @@ from .db import (
 )
 from .identity import NodeIdentity, is_valid_node_id
 from .ledger import LedgerError, ensure_ledger_copy, mirror_status
-from .node import Node, NodeError
+from .net_transport import TransportError
+from .node import Node, NodeError, NodeRemoteError
 from .state_machine import InvalidTransition
 from .tasks import InvalidTaskInput
 from .transport_tcp import fetch_server_certificate
+
+
+class JoinError(ValueError):
+    """Actionable join failure (invite state/connection/certificate)."""
 
 
 def _print(value: Any) -> None:
@@ -529,12 +534,18 @@ def cmd_join(args: argparse.Namespace) -> int:
     }
     expected = code.get("cert_sha256") or ""
     if expected:
-        der = _fetch_peer_cert(code["addr"])
+        try:
+            der = _fetch_peer_cert(code["addr"])
+        except Exception as exc:
+            raise JoinError(
+                f"无法连接 Coordinator {code['addr']} 获取证书：{exc}。"
+                "请检查公网地址/端口、安全组/防火墙和网络。"
+            ) from exc
         actual = hashlib.sha256(der).hexdigest()
         if actual != expected:
-            raise ValueError(
-                "coordinator certificate fingerprint does not match the invite "
-                f"(expected {expected[:16]}..., got {actual[:16]}...)"
+            raise JoinError(
+                "证书指纹不符，已拒绝连接。可能连接到了错误服务器或邀请码被篡改；"
+                "请核对公网地址，并向 Coordinator 重新申请邀请码。"
             )
         ca_path = Path(args.ca_file or "certs/server.crt")
         ca_path.parent.mkdir(parents=True, exist_ok=True)
@@ -547,14 +558,40 @@ def cmd_join(args: argparse.Namespace) -> int:
         config["capability"] = _DEFAULT_CAPABILITY
         config["discovery"] = {"announce_interval_seconds": 5}
         config["poll_interval_seconds"] = 1
-    config_out.parent.mkdir(parents=True, exist_ok=True)
-    config_out.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     node = Node(from_dict(config))
     try:
         node.join_with_invite(code["secret"], timeout=args.timeout)
         local_node_id = node.identity.node_id
+    except NodeRemoteError as exc:
+        text = str(exc)
+        reason = text.split("invite rejected:", 1)[-1].strip() if "invite rejected:" in text else ""
+        messages = {
+            "expired": "邀请码已过期。请向 Coordinator 重新申请一次性邀请码。",
+            "used": "邀请码已被使用。每个邀请码只能加入一次，请申请新的邀请码。",
+            "role_mismatch": "邀请码角色不匹配。Worker/Client 请使用对应角色的邀请码。",
+            "invalid": "邀请码无效（不存在、格式错误或已失效）。请核对完整邀请码。",
+        }
+        raise JoinError(messages.get(reason, f"加入被 Coordinator 拒绝：{text}")) from exc
+    except (TransportError, NodeError) as exc:
+        raise JoinError(
+            f"无法连接 Coordinator {code['addr']}：{exc}。"
+            "请检查公网地址/端口、安全组/防火墙、TLS 证书和网络。"
+        ) from exc
     finally:
         node.shutdown()
+    config_out.parent.mkdir(parents=True, exist_ok=True)
+    config_out.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    if role == "worker":
+        next_steps = [
+            f"python -m idle_compute node run --config {config_out}",
+            "在另一终端用 Client 的邀请码 join 并创建任务",
+        ]
+    else:
+        next_steps = [
+            "先确保配套 Worker 已启动",
+            f"python -m idle_compute node create-task --config {config_out} --numbers 1,2,3",
+            f"python -m idle_compute node status --config {config_out} --task-id <TASK_ID>",
+        ]
     _print(
         {
             "joined": True,
@@ -563,6 +600,7 @@ def cmd_join(args: argparse.Namespace) -> int:
             "coordinator_addr": code["addr"],
             "config": str(config_out),
             "cert_sha256": expected or None,
+            "next": next_steps,
         }
     )
     return 0

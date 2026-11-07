@@ -269,6 +269,60 @@ python -m idle_compute node create-task --config var/remote/client/node.json --n
 > 仍为单机/单 Coordinator 的邀请机制；**真实跨公网双设备验证尚未完成**，
 > 不要把本流程当作 D6 结果。
 
+### Worker + Client 成对加入（推荐）
+
+一次部署通常需要 **两个身份**，请分别生成两张邀请码（不要复用同一张）：
+
+```bash
+# Coordinator
+.venv/bin/python -m idle_compute invite create --config var/public-coord/node.json --role worker --ttl 3600
+.venv/bin/python -m idle_compute invite create --config var/public-coord/node.json --role client --ttl 3600
+# 把两张邀请码分别发给同一位合作伙伴
+```
+
+合作伙伴机器：
+
+```bash
+# Worker
+python -m idle_compute join --invite '<WORKER_INVITE>' --role worker --data-dir var/remote/worker
+python -m idle_compute node run --config var/remote/worker/node.json   # 保持运行
+
+# Client（另一个终端）
+python -m idle_compute join --invite '<CLIENT_INVITE>' --role client --data-dir var/remote/client
+python -m idle_compute node create-task --config var/remote/client/node.json --numbers 1,2,3
+python -m idle_compute node status --config var/remote/client/node.json --task-id <TASK_ID>
+```
+
+`join` 成功输出会包含下一步命令：
+
+```json
+{
+  "joined": true,
+  "node_id": "12D3KooW...",
+  "coordinator_node_id": "12D3KooW...",
+  "coordinator_addr": "101.133.233.126:17700",
+  "config": "var/remote/worker/node.json",
+  "cert_sha256": "d3be07...",
+  "next": [
+    "python -m idle_compute node run --config var/remote/worker/node.json",
+    "在另一终端用 Client 的邀请码 join 并创建任务"
+  ]
+}
+```
+
+### join 失败时的可操作提示
+
+| 报错 | 含义 / 处理 |
+| --- | --- |
+| `邀请码已过期` | 重新生成一张邀请码 |
+| `邀请码已被使用` | 每张邀请码只能加入一次，生成新的 |
+| `邀请码角色不匹配` | Worker 用 worker 邀请码，Client 用 client 邀请码 |
+| `邀请码无效` | 核对完整邀请码（不要截断/换行） |
+| `证书指纹不符` | 可能连到错误服务器或邀请码被篡改；核对公网地址并重新申请 |
+| `无法连接 Coordinator` | 检查公网地址/端口、安全组、TLS、证书和网络 |
+
+> 邀请码是 bearer secret；不要公开。失败时不会写入新配置，修正后重新执行 `join` 即可。
+
 ## 6. 启动（A 先，B 后）
 
 Coordinator（A）：
