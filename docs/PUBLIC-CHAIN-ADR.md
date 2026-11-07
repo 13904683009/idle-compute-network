@@ -261,3 +261,6 @@
 4. 每个 Phase 单独 ADR + 验收矩阵 + 安全审计，未通过不得进入下一阶段。
 
 > 再次强调：**本文件是设计草案，未实现，也不代表当前代码支持公链。**
+>
+> Phase 1 的链选型、最小合约、Coordinator 衔接与反滥用细化见
+> [`docs/PHASE1-ONCHAIN-DESIGN.md`](PHASE1-ONCHAIN-DESIGN.md)（同为设计草案，未实现）。
