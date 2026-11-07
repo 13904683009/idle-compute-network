@@ -80,6 +80,7 @@ _DEFAULTS = {
     "credits": {},
     "lease": {},
     "tls": None,
+    "chain_registry": None,
     "coordinator_node_id": None,
     "coordinator_addr": None,
     "poll_interval_seconds": 5,
@@ -187,6 +188,62 @@ def _parse_tls(value: Any) -> TlsConfig | None:
         key_file=key_file,
         ca_file=ca_file,
         server_hostname=server_hostname,
+    )
+
+
+@dataclass(frozen=True)
+class ChainRegistryConfig:
+    """Read-only EVM NodeRegistry admission (Phase 1 prototype)."""
+
+    enabled: bool = False
+    rpc_url: str = "http://127.0.0.1:8545"
+    registry_address: str = ""
+    refresh_seconds: int = 30
+    timeout_seconds: int = 5
+
+
+_CHAIN_KEYS = frozenset(
+    {"enabled", "rpc_url", "registry_address", "refresh_seconds", "timeout_seconds"}
+)
+
+
+def _parse_chain_registry(value: Any) -> ChainRegistryConfig | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError(
+            f"chain_registry must be an object or null, got {type(value).__name__}"
+        )
+    unknown = sorted(str(key) for key in value if key not in _CHAIN_KEYS)
+    if unknown:
+        raise ValidationError(f"chain_registry has unknown key(s): {', '.join(unknown)}")
+    enabled = value.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValidationError("chain_registry.enabled must be a bool")
+    rpc_url = value.get("rpc_url", "http://127.0.0.1:8545")
+    if not isinstance(rpc_url, str) or not rpc_url.startswith(("http://", "https://")):
+        raise ValidationError("chain_registry.rpc_url must be an http(s) URL")
+    registry_address = value.get("registry_address", "")
+    if not isinstance(registry_address, str):
+        raise ValidationError("chain_registry.registry_address must be a string")
+    refresh = value.get("refresh_seconds", 30)
+    if isinstance(refresh, bool) or not isinstance(refresh, int) or not 1 <= refresh <= 3600:
+        raise ValidationError("chain_registry.refresh_seconds must be an int in 1..3600")
+    timeout = value.get("timeout_seconds", 5)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 60:
+        raise ValidationError("chain_registry.timeout_seconds must be an int in 1..60")
+    if enabled:
+        if not registry_address.startswith("0x") or len(registry_address) != 42:
+            raise ValidationError(
+                "chain_registry.registry_address must be 0x + 40 hex when enabled"
+            )
+        int(registry_address[2:], 16)
+    return ChainRegistryConfig(
+        enabled=enabled,
+        rpc_url=rpc_url,
+        registry_address=registry_address,
+        refresh_seconds=refresh,
+        timeout_seconds=timeout,
     )
 
 
@@ -561,6 +618,7 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
     discovery = _parse_discovery(raw.get("discovery", _DEFAULTS["discovery"]))
     lease = _parse_lease(raw.get("lease", _DEFAULTS["lease"]))
     credits = _parse_credits(raw.get("credits", _DEFAULTS["credits"]))
+    chain_registry = _parse_chain_registry(raw.get("chain_registry"))
     tls = _parse_tls(raw.get("tls"))
     if tls is not None:
         if transport != "tcp":
@@ -584,6 +642,7 @@ def from_dict(raw: dict[str, Any]) -> NodeConfig:
         lease=lease,
         credits=credits,
         tls=tls,
+        chain_registry=chain_registry,
         coordinator_node_id=coordinator_node_id,
         coordinator_addr=coordinator_addr,
         poll_interval_seconds=poll_interval_seconds,
@@ -639,6 +698,7 @@ class NodeConfig:
     lease: LeaseConfig = field(default_factory=LeaseConfig)
     credits: CreditsConfig = field(default_factory=CreditsConfig)
     tls: TlsConfig | None = None
+    chain_registry: ChainRegistryConfig | None = None
     coordinator_node_id: str | None = None
     coordinator_addr: str | None = None
     poll_interval_seconds: int = 5
@@ -695,5 +755,13 @@ class NodeConfig:
                 "key_file": self.tls.key_file,
                 "ca_file": self.tls.ca_file,
                 "server_hostname": self.tls.server_hostname,
+            }
+        if self.chain_registry is not None:
+            data["chain_registry"] = {
+                "enabled": self.chain_registry.enabled,
+                "rpc_url": self.chain_registry.rpc_url,
+                "registry_address": self.chain_registry.registry_address,
+                "refresh_seconds": self.chain_registry.refresh_seconds,
+                "timeout_seconds": self.chain_registry.timeout_seconds,
             }
         return data

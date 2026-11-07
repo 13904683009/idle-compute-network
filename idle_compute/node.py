@@ -57,6 +57,7 @@ from typing import Any, Callable
 
 from . import ledger
 from .capability import CapabilityError, CapabilityManifest, CapabilityRevocation
+from .chain_registry import ChainRegistryClient, ChainRegistryError
 from .config import NodeConfig, ValidationError, is_valid_node_id
 from .db import (
     DuplicateSubmission,
@@ -263,6 +264,18 @@ class Node:
         self._seq_lock = threading.Lock()
         self._send_seq = self._load_seq()
         self._allowlisted = set(self.config.peers)
+        self._chain: ChainRegistryClient | None = None
+        if (
+            config.role == "coordinator"
+            and config.chain_registry is not None
+            and config.chain_registry.enabled
+        ):
+            self._chain = ChainRegistryClient(
+                config.chain_registry.rpc_url,
+                config.chain_registry.registry_address,
+                refresh_seconds=config.chain_registry.refresh_seconds,
+                timeout_seconds=config.chain_registry.timeout_seconds,
+            )
         if config.role == "coordinator" and self._aux is not None:
             self._seq_window = SeqWindow(
                 load=self._seen_load,
@@ -426,6 +439,11 @@ class Node:
         logger.info("invite accepted peer=%s role=%s", peer_id[:12], role)
         return True, ""
 
+    def _chain_admits(self, peer_id: str, role: str) -> bool:
+        if self._chain is None:
+            return False
+        return self._chain.is_active(peer_id, role)
+
     def _has_joined(self, peer_id: str) -> bool:
         if self._aux is None:
             return False
@@ -574,6 +592,15 @@ class Node:
                         self._allowlisted.add(env.sender)
                     elif self._has_joined(env.sender):
                         self._allowlisted.add(env.sender)
+                    elif self._chain is not None and self._chain_admits(
+                        env.sender, str(env.body.get("role", ""))
+                    ):
+                        self._allowlisted.add(env.sender)
+                        logger.info(
+                            "chain registry admitted peer=%s role=%s",
+                            env.sender[:12],
+                            env.body.get("role"),
+                        )
                     else:
                         logger.warning(
                             "connection rejected peer=%s reason=%s",
@@ -1450,6 +1477,11 @@ class Node:
         if not self._started:
             self.transport.start()
             self._started = True
+            if self._chain is not None:
+                try:
+                    self._chain.refresh(force=True)
+                except ChainRegistryError as exc:
+                    logger.warning("chain registry unavailable at startup: %s", exc)
             addrs = self.transport.advertised_addrs() or [
                 f"{self.config.listen_host}:{self.config.listen_port}"
             ]
@@ -1503,6 +1535,11 @@ class Node:
                     self._store.expire_leases()
                 except Exception:
                     logger.exception("lease expiry failed")
+                if self._chain is not None:
+                    try:
+                        self._chain.refresh()
+                    except ChainRegistryError:
+                        pass
                 try:
                     self._discovery_tick()
                 except Exception:
