@@ -1,8 +1,8 @@
-# NodeRegistry 原型（Anvil 本地链）
+# NodeRegistry 原型（Anvil 本地链 / Base Sepolia 脚本）
 
-> **原型，不是生产实现。** 未部署到 Base Sepolia：当前环境没有可用的测试币钱包/faucet。
-> 本演示使用本机 Anvil 本地链，验证“链上注册 + Coordinator 读取 + 任务闭环”。
-> 无代币、无转账、无 escrow；`NodeRegistry.sol` 未审计。
+> **原型，不是生产实现。**
+> **当前状态：Anvil 原型已跑通；Base Sepolia 尚未部署**（部署地址测试币余额为 0，
+> 未获得 faucet 资金）。无代币、无转账、无 escrow；`NodeRegistry.sol` 未审计。
 
 ## 1. 合约
 
@@ -39,7 +39,61 @@ python scripts/deploy_node_registry.py --rpc http://127.0.0.1:8545
 ```
 
 脚本使用 Anvil 的 unlocked 账户（`eth_accounts` + `eth_sendTransaction`），不处理私钥；
-**不适用于 Base Sepolia**（公网链需要签名交易；后续需增加用私钥签名的部署脚本）。
+只适用于本地/测试链，**不适用于 Base Sepolia**。
+
+## 3a. Base Sepolia 部署（脚本已就绪，尚未实际上链）
+
+### 获取测试币
+
+使用任意 Base Sepolia faucet（需要登录/账号，按各站点要求）：
+
+- Alchemy: <https://www.alchemy.com/faucets/base-sepolia>
+- QuickNode: <https://faucet.quicknode.com/base/sepolia>
+- Coinbase CDP faucet: <https://portal.cdp.coinbase.com/products/faucet>
+
+只需少量测试 ETH（例如 0.01–0.05）用于部署与几次注册。**只使用测试网私钥**，
+不要使用主网私钥。
+
+### 部署（私钥签名）
+
+```bash
+pip install "web3>=7"
+# 私钥写入文件，权限 600；或使用环境变量 BASE_SEPOLIA_PRIVATE_KEY
+python scripts/deploy_node_registry_signed.py \
+  --rpc https://sepolia.base.org \
+  --chain-id 84532 \
+  --private-key-file ~/.base-sepolia.key
+# 先 dry-run（不发交易）：
+python scripts/deploy_node_registry_signed.py ... --dry-run
+```
+
+脚本会校验 RPC chain id、打印部署地址余额、用 EIP-1559 签名交易、等待 receipt，
+并输出：
+
+```json
+{"contract_address": "0x...", "tx_hash": "0x...", "block": 123, "explorer": "https://sepolia.basescan.org/address/0x..."}
+```
+
+私钥来源优先级：`--private-key` > `--private-key-file` > `BASE_SEPOLIA_PRIVATE_KEY` /
+`EVM_PRIVATE_KEY`；私钥不会写入日志。
+
+### Coordinator 读取 Base Sepolia 合约
+
+```json
+"chain_registry": {
+  "enabled": true,
+  "rpc_url": "https://sepolia.base.org",
+  "registry_address": "<DEPLOYED_ADDRESS>",
+  "refresh_seconds": 30,
+  "timeout_seconds": 10
+}
+```
+
+### 当前状态
+
+- **尚未部署**：测试网部署地址余额为 0，未从 faucet 取得测试币；
+- 部署脚本与 dry-run 已提供；充值后执行上面的命令即可，实际地址需填入 Coordinator 配置；
+- 未在 Base Sepolia 上做过注册/任务演示，不能声称公链验证完成。
 
 ## 4. 端到端演示
 

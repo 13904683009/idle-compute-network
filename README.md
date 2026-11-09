@@ -14,7 +14,7 @@
 | 项 | 状态 |
 | --- | --- |
 | D1–D5 | 已完成（能力/公告/匹配器/双签租约/本地模拟注册表，已接入节点与 matcher） |
-| 测试 | **479 项**标准库 unittest，全部通过（`python -m unittest discover -s tests -v`） |
+| 测试 | **570 项**标准库 unittest，全部通过（`python -m unittest discover -s tests -v`） |
 | 真实双设备（D6） | **未执行**；文档与测试仅覆盖单机多进程 |
 | 链上注册表 / 共识 / 代币 | **未实现**；`LocalRegistryAdapter` 只是本地 SQLite 模拟，已接入节点告示与 matcher 的 registry-first 校验，**不是**链上/共识 |
 | 公网可达部署 | **支持（产品推荐）**：coordinator 监听 `0.0.0.0`/公网 IP（`allow_public_listen=true`），worker/client 主动连接公网地址；单机已用非 loopback 地址跑通全流程 |
